@@ -1,0 +1,46 @@
+asgsvc/join.ae: In function ‘__ae_worker_bootstrap_from_list’:
+asgsvc/join.ae:398:59: error: ‘struct
+bootstrap_from_list_return_params’ has no member named
+‘tryadd_398_9_ret’
+
+This happens (at least) when the function has a void return type, but
+you attempt to assign its return value.
+
+===
+
+The following test fails because the declaration of the variable
+follows the conditional. Declaring the variable at the beginning of
+the file fixes this. In general, it's always a good idea to have
+variable declarations at the top of functions, without assignments.
+
+[mlcurry@localhost bin]$ cat test.ae
+#include <aesop/aesop.h>
+
+void
+test(void)
+{
+	if (1 > 0) {
+		printf("Hello.\n");
+	}
+	int i;
+	return;
+}
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	test();
+	return 0;
+}
+
+aesop_main_set(aemain);
+
+[mlcurry@localhost bin]$ ./aecc test.ae
+Compilation step failed:
+test.ae: In function ‘test’:
+test.ae:8:3: error: stray ‘#’ in program
+  }
+   ^
+test.ae:8:7: error: expected ‘;’ before string constant
+  }    ^
+

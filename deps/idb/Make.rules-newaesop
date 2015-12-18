@@ -1,0 +1,41 @@
+#
+# Output dist version
+#
+.phony: distversion
+distversion:
+	@echo $(VERSION)
+
+#
+# Easy way to build unit tests without running them
+# 
+.phony: tests
+tests: $(check_PROGRAMS)
+
+AE_COMPILE_FLAGS = $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) \
+    $(CPPFLAGS) $(AM_CFLAGS) $(CFLAGS)
+#
+# rule for compiling aesop .ae files
+#
+.ae.o:
+	$(AM_V_GEN) $(AECC) $(AE_COMPILE_FLAGS) -o $@ $<
+
+.ae.lo:
+	$(AM_V_GEN) $(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOL_FLAGS) \
+        $(LIBTOOLFLAGS) --mode=compile \
+        $(AECC) $(AE_COMPILE_FLAGS) -o $@ $<
+
+.hae.h:
+	$(AM_V_GEN) $(AECC) --ae-parse-hae $(AE_COMPILE_FLAGS) -o $@ $<
+
+#
+# rules for .ae dependencies
+#
+dirname = $(patsubst %/,%,$(dir $(1)))
+
+%.ae.d: %.ae
+	mkdir -p $(call dirname,$@)
+	$(AM_V_GEN)CC="$(CC)" CPPFLAGS="$(AM_CPPFLAGS) $(CPPFLAGS)" CFLAGS="$(AM_CFLAGS) $(CFLAGS)" $(srcdir)/maint/depend-ae.sh $(call dirname,$@) $< > $@
+
+%.hae.d: %.hae
+	mkdir -p $(call dirname,$@)
+	$(AM_V_GEN)CC="$(CC)" CPPFLAGS="$(AM_CPPFLAGS) $(CPPFLAGS)" CFLAGS="$(AM_CFLAGS) $(CFLAGS)" $(srcdir)/maint/depend-ae.sh $(call dirname,$@) $< > $@

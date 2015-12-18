@@ -1,0 +1,37 @@
+Each hoss_op must designate several operations with different roles:
+
+- prep     - One-time foundational work
+- exec     - Work that may have to be repeated
+- finish   - Solidify work that has been performed
+- rollback - Undo work that has been performed
+- cleanup  - Free resources reserved to do operation
+
+The calling will proceed along the following path:
+
+Prep
+do {
+   exec();
+   finish();
+} while (deadlock && repeat_on_deadlock);
+if (error)
+   rollback();
+cleanup();
+
+Whether this is on the operation level or group level depends on the
+combination of flags used. Here are the interesting cases:
+
+
+Neither MSYNC nor DEFERRED set: Each operation is executed on its own,
+in its own context. It should be retried immediately from within the
+operation itself.
+
+MSYNC set, DEFERRED not set: Operations are aggregated into a single
+IDBX. Deadlock aborts the group and returns deadlock to the user.
+
+MSYNC not set, DEFERRED set: Operations are executed on their own, in
+their own context. It should be retried immediately from within the
+operation.
+
+MSYNC and DEFERRED set: Operations are aggregated into a single
+IDBX. Deadlock aborts the group, but starts the group over again from
+within hoss_end.

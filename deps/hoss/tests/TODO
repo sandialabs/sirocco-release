@@ -1,0 +1,10 @@
+- Deferred vs. non-deferred
+- sync vs. non-sync
+- ordered vs. non-ordered
+- short vs. non-short
+- Error free vs. read error vs. write error
+- Aborted versus successful
+- Re-issue for deadlock
+- Clarify roles of rc's
+- Clarify how IDBXs are put back
+- RAW

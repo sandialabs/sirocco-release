@@ -1,0 +1,337 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <pthread.h>
+#include <limits.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <aesop/aesop.h>
+#include <aesop/aefile.hae>
+#include <triton-hash.h>
+#include <recordstore.hae>
+
+#include "recordstore-config.h"
+#include "recordstore-method.hae"
+#include "fd-cache.hae"
+#include "sync-mgr.hae"
+#include "alignment.hae"
+
+static void* file_init(const char* params);
+static __blocking int file_write(void* method_data, rs_key_t key, 
+    const void* buffer, size_t nbytes, rs_id_t* out_id);
+static __blocking int file_read(void* method_data, rs_key_t key, 
+    rs_id_t id, void* buffer, size_t nbytes, off_t relative_offset);
+static __blocking int file_deprecate(void* method_data, rs_key_t key, 
+    rs_id_t id);
+static __blocking int file_flush(void* method_data, rs_key_t key, rs_id_t id);
+static void file_diag(void* method_data);
+static void file_finalize(void* method_data);
+
+struct recordstore_method rs_file_method = 
+{
+    .name = "file",
+    .init = file_init,
+    .write = file_write,
+    .read = file_read,
+    .deprecate = file_deprecate,
+    .flush = file_flush,
+    .diag = file_diag,
+    .finalize = file_finalize,
+};
+
+struct file_method_data
+{
+    /* incoming writes will be grouped into separate memory allocation logs
+     * according to the first key_prefix_bytes of the key.
+     */
+    int key_prefix_bytes;
+    char path[PATH_MAX];
+    int64_t alignment;
+    int open_flags;
+    struct rs_fd_cache_instance* fdci;
+    struct sync_mgr_instance* smi;
+    int sync_highwater;
+};
+
+static void* file_init(const char* params)
+{
+    struct file_method_data *data;
+    char* param_idx;
+    int ret;
+
+    data = malloc(sizeof(*data));
+    if(!data)
+        return(NULL);
+    memset(data, 0, sizeof(*data));
+
+    if(params)
+    {
+        param_idx = strstr(params, "key_prefix_bytes:");
+        if(param_idx)
+            sscanf(param_idx, "key_prefix_bytes:%d", &data->key_prefix_bytes);
+        param_idx = strstr(params, "sync_highwater:");
+        if(param_idx)
+            sscanf(param_idx, "sync_highwater:%d", &data->sync_highwater);
+        param_idx = strstr(params, "path:");
+        if(param_idx)
+        {
+            sscanf(param_idx, "path:%s", data->path);
+            param_idx = index(data->path, ',');
+            if(param_idx)
+                param_idx[0] = '\0';
+        }
+        param_idx = strstr(params, "alignment:");
+        if(param_idx)
+            sscanf(param_idx, "alignment:" SCANF_lld, &data->alignment);
+        param_idx = strstr(params, "O_DIRECT");
+        if(param_idx)
+        {
+#ifdef HAVE_ODIRECT
+            data->open_flags |= O_DIRECT;
+#else
+            fprintf(stderr, "Error: O_DIRECT specified but is not supported by system.\n");
+            free(data);
+            return(NULL);
+#endif
+        }
+        param_idx = strstr(params, "O_SYNC");
+        if(param_idx)
+            data->open_flags |= O_SYNC;
+    }
+
+    /* default to byte alignment if not specified */
+    if(!data->alignment)
+        data->alignment = 1;
+    /* default to a sync highwater of 16 if not specified */
+    if(!data->sync_highwater)
+        data->sync_highwater = 16;
+    /* default to a key prefix of 16 bytes if not specified */
+    if(!data->key_prefix_bytes)
+        data->key_prefix_bytes = 16;
+   
+    /* create storage path if needed */
+    ret = mkdir(data->path, 0755);
+    if(ret != 0 && errno != EEXIST)
+    {
+        /* TODO: how to get more helpful error out of API */
+        perror("mkdir");
+        free(data);
+        return(NULL);
+    }
+
+    /* initialize aesop file api */
+    ret = aefile_init();
+    if(ret != 0)
+    {
+        free(data);
+        return(NULL);
+    }
+
+    /* intialize fd cache */
+    data->fdci = rs_fd_cache_initialize(data->path, data->alignment,
+        data->open_flags, data->sync_highwater);
+    if(!data->fdci)
+    {
+        aefile_finalize();
+        free(data);
+        return(NULL);
+    }
+
+    /* intialize sync mgr */
+    data->smi = sync_mgr_initialize(data->sync_highwater, data->open_flags);
+    if(!data->smi)
+    {
+        rs_fd_cache_finalize(data->fdci);
+        aefile_finalize();
+        free(data);
+        return(NULL);
+    }
+    return(data);
+}
+
+static __blocking int file_write(void* method_data, rs_key_t key, 
+    const void* buffer, size_t nbytes, rs_id_t* out_id)
+{
+    struct file_method_data *data = method_data;
+    rs_key_t prefix;
+    int ret;
+    struct rs_fd_cache_entry* entry;
+    off_t offset;
+    off_t aligned_nbytes;
+    struct sync_group *sg;
+
+    /* find appropriate log based on the first key_prefix_bytes of the key */
+    memset(&prefix, 0, sizeof(prefix));
+    memcpy(prefix.data, key.data, data->key_prefix_bytes);
+
+    /* get file descriptor for log */
+    ret = rs_fd_cache_get(data->fdci, &entry, prefix);
+    if(ret < 0)
+    {
+        return(ret);
+    }
+
+    sg = sync_mgr_start_write(data->smi, entry->fd);
+
+    aligned_nbytes = (nbytes/data->alignment) * data->alignment;
+    if(nbytes%data->alignment)
+        aligned_nbytes += data->alignment;
+
+    pthread_mutex_lock(&entry->log_offset_mutex);
+    offset = entry->log_offset;
+    entry->log_offset += aligned_nbytes;
+    pthread_mutex_unlock(&entry->log_offset_mutex);
+
+    ret = align_write(entry->fd, buffer, nbytes, offset, data->alignment);
+    if(ret != 0)
+    {
+        rs_fd_cache_put(entry);
+        return(ret);
+    }
+     
+    /* assign id with log offset and size */
+    memset(out_id, 0, sizeof(*out_id));
+    memcpy(&out_id->data[0], &offset, sizeof(offset));
+    memcpy(&out_id->data[8], &nbytes, sizeof(nbytes));
+   
+    rs_fd_cache_put(entry);
+
+    ret = sync_mgr_end_write(data->smi, sg);
+
+    return(ret);
+}
+
+static __blocking int file_read(void* method_data, rs_key_t key, 
+    rs_id_t id, void* buffer, size_t nbytes, off_t relative_offset)
+{
+    struct file_method_data *data = method_data;
+    rs_key_t prefix;
+    int ret;
+    struct rs_fd_cache_entry* entry;
+    int64_t offset;
+
+    /* find appropriate log based on the first key_prefix_bytes of the key */
+    memset(&prefix, 0, sizeof(prefix));
+    memcpy(prefix.data, key.data, data->key_prefix_bytes);
+
+    /* pull offset out of id */
+    memcpy(&offset, &id.data[0], sizeof(offset));
+    offset += relative_offset;
+
+    /* get file descriptor for log */
+    ret = rs_fd_cache_get(data->fdci, &entry, prefix);
+    if(ret < 0)
+    {
+        return(ret);
+    }
+    
+    ret = align_read(entry->fd, buffer, nbytes, offset, data->alignment);
+    if(ret != 0)
+    {
+        rs_fd_cache_put(entry);
+        return(ret);
+    }
+   
+    rs_fd_cache_put(entry);
+
+    return(0);
+}
+
+static __blocking int file_deprecate(void* method_data, rs_key_t key, 
+    rs_id_t id)
+{
+    struct file_method_data *data = method_data;
+    rs_key_t prefix;
+    int ret;
+    struct rs_fd_cache_entry* entry;
+    int64_t offset;
+    size_t nbytes;
+
+    /* find appropriate log based on the first key_prefix_bytes of the key */
+    memset(&prefix, 0, sizeof(prefix));
+    memcpy(prefix.data, key.data, data->key_prefix_bytes);
+
+    /* pull offset and size out of id */
+    memcpy(&offset, &id.data[0], sizeof(offset));
+    memcpy(&nbytes, &id.data[8], sizeof(nbytes));
+
+    /* round up nbytes to alignment */
+    if(nbytes % data->alignment)
+        nbytes = ((nbytes/data->alignment)+1)*data->alignment;
+
+    /* get file descriptor for log */
+    ret = rs_fd_cache_get(data->fdci, &entry, prefix);
+    if(ret < 0)
+    {
+        return(ret);
+    }
+
+    pbranch
+    {
+#ifdef HAVE_FALLOC_FL_PUNCH_HOLE
+        ret = aefile_fallocate(entry->fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,
+            offset, nbytes);
+#endif
+        rs_fd_cache_put(entry);
+    }
+    
+    /* TODO: unlink log file if everything is deprecated?  Problem is how to
+     * track how much data is in use over time in a log file...
+     */
+
+    return(0);
+}
+
+static __blocking int file_flush(void *method_data, rs_key_t key, rs_id_t id)
+{
+    struct file_method_data *data = method_data;
+    int ret;
+
+    /* NOTE: this could be optimized further.  We don't track sequence of
+     * keys that have been written, so for now this will cause sync of all
+     * key writes that have completed to this point.
+     */
+
+    ret = sync_mgr_flush_all(data->smi);
+
+    return(ret);
+}
+
+static void file_diag(void* method_data)
+{
+    struct file_method_data *data = method_data;
+
+    printf("# Diagnostics for recordstore \"file\" with method_data %p:\n", method_data);
+    printf("#   key_prefix_bytes: %d\n", data->key_prefix_bytes);
+
+    return;
+}
+
+static void file_finalize(void* method_data)
+{
+    struct file_method_data *data = method_data;
+
+    sync_mgr_finalize(data->smi);
+    rs_fd_cache_finalize(data->fdci);
+    aefile_finalize();
+    free(data);
+
+    return;
+}
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

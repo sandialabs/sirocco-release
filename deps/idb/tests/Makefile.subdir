@@ -1,0 +1,27 @@
+testlib = src/libidb.a
+aetestlib = src/libaeidb.a
+
+check_PROGRAMS += \
+ tests/idb \
+ tests/aeidb \
+ tests/ddlk \
+ tests/next
+
+TESTS += \
+ tests/idb \
+ tests/aeidb \
+ tests/ddlk \
+ tests/next
+
+tests_idb_LDADD = $(testlib) -lpthread
+tests_idb_SOURCES = tests/idb.c
+tests_aeidb_LDADD=$(aetestlib) -lpthread -lev
+tests_aeidb_SOURCES = tests/aeidb.ae
+tests_ddlk_LDADD = $(testlib) -lpthread
+tests_ddlk_SOURCES = tests/ddlk.c
+tests_next_LDADD = $(testlib) -lpthread
+tests_next_SOURCES = tests/next.c
+
+
+tests/aeidb.ae: src/c_to_ae.c tests/idb.c
+	cat $^ > $@

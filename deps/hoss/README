@@ -1,0 +1,9 @@
+Note:
+
+- Deferred READs still have I/O done within the context of a
+  transaction. One implementation strategy is to copy all affected
+  intervals from the IDB while the transaction is running, and perform
+  the I/O after the transaction has committed. There is a problem with
+  this strategy: After the transaction has committed, it is possible
+  for another process to intervene and punch a region that is
+  scheduled for read. This could be seriously difficult.

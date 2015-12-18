@@ -1,0 +1,310 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+
+#include <hoss.hae>
+
+#define STRINGIFY2(x) #x
+#define STRINGIFY(x) STRINGIFY2(x)
+#define WARN(...) fprintf(stderr, "HOSSTEST WARNING @" __FILE__ ","	\
+			  STRINGIFY(__LINE__) ": " __VA_ARGS__)
+#define ERR(...) fprintf(stderr, "HOSSTEST ERROR @" __FILE__ ","	\
+			  STRINGIFY(__LINE__) ": " __VA_ARGS__)
+
+static void
+bail(int err)
+{
+	ERR("%s", strerror(err));
+	abort();
+}
+
+unsigned char *contents, *rbuf;
+size_t contents_size = 128*1024*1024;
+size_t rand_workload = 0;
+double test_time = 10.0;
+hoss_update_t update_id = 1;
+struct hoss_oid obj_id;
+struct hoss_ctx *hoss;
+
+/* Writes the associated block from the contents array into the store */
+static __blocking void
+wblock(hoss_off_t off, hoss_size_t size)
+{
+	hoss_size_t tfer;
+	int rc, iorc;
+	struct hoss_grp *grp;
+
+	rc = hoss_begin(&grp, NULL, 0, hoss);
+	if (rc != 0)
+		bail(errno);
+
+	iorc = 0;
+	rc = hoss_write(
+		&obj_id, //struct hoss_oid *oid,
+		off,     //hoss_off_t start,
+		size,    //hoss_size_t nrecs,
+		1,       //hoss_size_t reclen,
+		0,       //hoss_flags_t flags,
+		0,       //hoss_update_t update_condition,
+		1,       //hoss_update_t new_update,
+		(contents + off),     //const void *writebuf,
+		grp,    //struct hoss_grp *grp);
+		&tfer,     //hoss_size_t *transferred,
+		&iorc);
+	if (size != tfer || rc != 0 || iorc != 0)
+		bail(errno);
+
+	rc = hoss_end(grp, 1);
+	if (rc != 0)
+		bail(errno);
+}
+
+static __blocking void
+rblock(hoss_off_t off, hoss_size_t size)
+{
+	hoss_size_t used;
+	hoss_update_t upinfo;
+	int rc, iorc;
+	struct hoss_grp *grp;
+
+	rc = hoss_begin(&grp, NULL, 0, hoss);
+	if (rc != 0)
+		bail(errno);
+
+	iorc = 0;
+	rc = hoss_read(
+		&obj_id,    //struct hoss_oid *oid,
+		off,        //hoss_off_t start,
+		size,       //hoss_size_t size,
+		0,          //hoss_flags_t flags,
+		0,          //hoss_update_t update_condition,
+		rbuf,       //void *buf,
+		size,       //hoss_size_t bufsize,
+		NULL,       //struct hoss_record_info *ribuf,
+		0,          //hoss_size_t maxris,
+		grp,        //struct hoss_grp *grp);
+		&used,      //hoss_size_t *bufused,
+		NULL,       //hoss_size_t *nris,
+		&upinfo,    //hoss_update_t *update_info,
+		&iorc);     //int *rc
+
+	if (rc != 0 || iorc != 0)
+		bail(errno);
+	if (used != size)
+		printf("Warning: Expected %lu from read, got %lu\n",
+		       size, used);
+
+	rc = hoss_end(grp, 1);
+	if (rc != 0)
+		bail(errno);
+
+	if (memcmp(contents + off, rbuf, size) != 0)
+		bail(0);
+}
+
+__blocking static void
+init(void)
+{
+	int rc;
+	size_t i;
+
+	srand(time(NULL));
+
+	contents = calloc(contents_size, 1);
+	rbuf = calloc(contents_size, 1);
+	if (contents == NULL || rbuf == NULL)
+		bail(ENOMEM);
+
+	obj_id.nids = rand() % 4;
+	if (obj_id.nids > 0) {
+		obj_id.ids = malloc(sizeof(obj_id.ids[0]) * obj_id.nids);
+		if (obj_id.ids == NULL) {
+			bail(ENOMEM);
+		}
+		for (i = 0; i < obj_id.nids; i++)
+			obj_id.ids[i] = (hoss_eid_t)rand();
+	} else {
+		obj_id.ids = NULL;
+	}
+
+	rc = hoss_init(&hoss, ".");
+	if (rc != 0)
+		bail(rc);
+
+	wblock(0, contents_size);
+
+	return;
+}
+
+__blocking static void
+fini(void)
+{
+	free(contents);
+	free(rbuf);
+	free(obj_id.ids);
+	hoss_fini(hoss);
+}
+
+static double
+dtime(void)
+{
+	struct timeval tv;
+
+	if (gettimeofday(&tv, NULL)) {
+		ERR("gettimeofday failed: %s\n", strerror(errno));
+		abort();
+	}
+	return ((double)tv.tv_sec) + ((double)tv.tv_usec)/1000000.0;
+}
+
+static uint64_t
+u64_rand(void)
+{
+	uint64_t ret = 0;
+	int i;
+
+	for (i = 0; i < 8; i++)
+		ret = (ret << 8) + (rand() % 256);
+
+	return ret;
+}
+
+__blocking static void
+smallrandtest()
+{
+	size_t i, ntests = 0;
+	hoss_off_t begin, end;
+	hoss_size_t size, written = 0;
+	double t[2], dt;
+
+	t[0] = dtime();
+	while(written < 2*contents_size) {
+		ntests++;
+		do {
+			begin = u64_rand() % (contents_size - 4096);
+		} while (begin == contents_size - 1);
+		size = 4096;
+		end = begin + size;
+
+		wblock(begin, size);
+		written += size;
+		if (begin > 4096) {
+			begin-=4096;
+			size+=4096;
+		} else {
+			size += begin;
+			begin = 0;
+		}
+		if (end < contents_size - 4096 - 1) {
+			end+=4096;
+			size+=4096;
+		} else {
+			size += contents_size - 1 - end;
+			end = contents_size - 1;
+		}
+		rblock(begin, size);
+	}
+	t[1] = dtime();
+	dt = t[1] - t[0];
+
+	printf("SmallRand read/write test:   \t");
+	printf("start: %.2lf sec   \t"
+	       "end: %.2lf sec   \t"
+	       "etime: %.2lf sec   \t"
+	       "ntests: %lu   \t"
+	       "size: %2lf MB   \t"
+	       "rate: %lf MB/s\n",
+	       t[0], t[1], dt, ntests, written/1e6, written * 2/1e6/dt);
+
+}
+
+__blocking static void
+randtest()
+{
+	size_t i, test, ntests = 0;
+	hoss_off_t begin, end;
+	hoss_size_t size, written = 0;
+	double t[2], dt;
+
+	t[0] = dtime();
+	while (written < 4 * contents_size) {
+		ntests++;
+		begin = u64_rand() % contents_size;
+		do {
+			end = u64_rand() % contents_size;
+		} while (begin == end);
+		if (begin > end) {
+			size = begin - end;
+			begin = end;
+			end = begin + size;
+		} else {
+			size = end - begin;
+		}
+		for (i = begin; i < end; i++)
+			contents[i] = rand()%256;
+		wblock(begin, size);
+		written += size;
+
+		if (begin > 0) {
+			begin--;
+			size++;
+		}
+		if (end < contents_size - 1) {
+			end++;
+			size++;
+		}
+		rblock(begin, size);
+		printf("ntests = %lu\n", ntests);
+	}
+	t[1] = dtime();
+	dt = t[1] - t[0];
+
+	printf("Random read/write test:   \t");
+	printf("start: %.2lf sec   \t"
+	       "end: %.2lf sec   \t"
+	       "etime: %.2lf sec   \t"
+	       "ntests: %lu   \t"
+	       "size: %2lf MB   \t"
+	       "rate: %lf MB/s\n",
+	       t[0], t[1], dt, ntests, written/1e6, written * 2/1e6/dt);
+
+}
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	int rc;
+	size_t i;
+	double t[2], dt;
+
+	init();
+
+	printf("Sequential write test:   \t");
+	t[0] = dtime();
+	for (i = 0; i < contents_size; i+=64*1024) {
+		wblock(i, 64*1024);
+	}
+	t[1] = dtime();
+	dt = t[1] - t[0];
+	printf("start: %.2lf sec   \t"
+	       "end: %.2lf sec   \t"
+	       "etime: %.2lf sec   \t"
+	       "size: %2lf MB   \t"
+	       "rate: %lf MB/s\n",
+	       t[0], t[1], dt, contents_size/1e6, contents_size/1e6/dt);
+
+	randtest();
+	smallrandtest();
+	fini();
+
+	return 0;
+}
+
+aesop_main_set(aemain);

@@ -1,0 +1,51 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <assert.h>
+#include <stdio.h>
+
+#include <hoss.hae>
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	struct hoss_grp *g;
+	struct hoss_ctx *hoss;
+	struct hoss_oid oid;
+	hoss_eid_t eid;
+	hoss_size_t nb;
+	hoss_flags_t f;
+	int rc;
+        int orc;
+
+	printf("Hello, world!\n");
+
+	rc = hoss_init(&hoss, ".");
+	assert(rc == 0);
+
+	rc = hoss_begin(&g, NULL, 0, hoss);
+	assert(rc == 0);
+
+	rc = hoss_end(g, 0);
+	assert(rc == 0);
+
+	oid.nids = 1;
+	oid.ids = &eid;
+
+	for (f = 0; f <= HOSS_GRP_FLAG_MASK; f++) {
+		rc = hoss_begin(&g, NULL, f, hoss);
+		assert(rc == 0);
+		eid = 0;
+		rc = hoss_write(&oid, 0, sizeof(eid), 1, 0, 0, 1,
+				&eid, g, &nb, &orc);
+		assert(rc == 0);
+		rc = hoss_end(g, 0);
+		assert(rc == 0);
+	}
+
+	hoss_fini(hoss);
+	printf("Successful exit.\n");
+	return 0;
+}
+
+aesop_main_set(aemain);

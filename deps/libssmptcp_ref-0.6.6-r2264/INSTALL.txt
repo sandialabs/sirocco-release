@@ -1,0 +1,11 @@
+INSTALLATION NOTES
+
+This distribution was generated with GNU AutoTools, meaning that it supports
+the full range of options typically offered.
+
+Note that this release has only been tested when statically linked.
+
+Basic installation:
+
+./configure
+make install

@@ -1,0 +1,15 @@
+Contributors to Sirocco:
+- Lee Ward (lee@sandia.gov)
+- Matthew Curry (mlcurry@sandia.gov)
+- Geoff Danielson (geoffrey.danielson@hpe.com)
+
+This software depends on Recordstore, primarily developed by Phil
+Carns at Argonne National Laboratory.
+
+This software depends on the Single-Sided Messaging (SSM) library,
+primarily developed by Matthew Shane Farmer at Auburn University.
+
+Sandia National Laboratories is a multi-program laboratory managed and
+operated by Sandia Corporation, a wholly owned subsidiary of Lockheed
+Martin Corporation, for the U.S. Department of Energys National
+Nuclear Security Administration under contract DE-AC04-94AL85000.

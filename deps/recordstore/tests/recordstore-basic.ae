@@ -1,0 +1,109 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#include <stdio.h>
+
+#include <recordstore.hae>
+
+__blocking int aesop_main(int argc, char **argv)
+{
+    rs_instance_t ri;
+    int ret;
+    rs_key_t key1, key2;
+    rs_id_t id1, id2;
+    const char* buffer1 = "Hello ";
+    const char* buffer2 = "world!";
+    uint64_t cofr1[4]; /* collection, object, fork, record notation */
+    uint64_t cofr2[4];
+    char buffer3[256];
+    char buffer4[256];
+
+    if(argc != 3)
+    {
+        fprintf(stderr, "Usage: recordstore-basic <method> <params>\n");
+        fprintf(stderr, "  example: ./recordstore-basic file path:/tmp/foo");
+        fprintf(stderr, "  example: ./recordstore-basic memory \"\"");
+    }
+
+    ri = rs_init(argv[1], argv[2]);
+    if(ri == NULL)
+    {
+        fprintf(stderr, "Error: rs_init() failure.\n");
+        return(-1);
+    }
+
+    cofr1[0] = 1;
+    cofr1[1] = 1;
+    cofr1[2] = 0;
+    cofr1[3] = 0;
+    memcpy(key1.data, cofr1, 4*sizeof(uint64_t));
+    cofr2[0] = 1;
+    cofr2[1] = 1;
+    cofr2[2] = 0;
+    cofr2[3] = 1;
+    memcpy(key2.data, cofr2, 4*sizeof(uint64_t));
+
+    ret = rs_write(ri, key1, buffer1, strlen(buffer1)+1, &id1);
+    if(ret != 0)
+    {
+        fprintf(stderr, "Error: rs_write() failure: %d\n", ret);
+        return(-1);
+    }
+
+    ret = rs_write(ri, key2, buffer2, strlen(buffer2)+1, &id2);
+    if(ret != 0)
+    {
+        fprintf(stderr, "Error: rs_write() failure: %d\n", ret);
+        return(-1);
+    }
+
+    ret = rs_read(ri, key1, id1, buffer3, strlen(buffer1)+1, 0);
+    if(ret != 0)
+    {
+        fprintf(stderr, "Error: rs_read() failure: %d\n", ret);
+        return(-1);
+    }
+
+    ret = rs_read(ri, key2, id2, buffer4, strlen(buffer2)+1, 0);
+    if(ret != 0)
+    {
+        fprintf(stderr, "Error: rs_read() failure: %d\n", ret);
+        return(-1);
+    }
+
+    printf("data confirmation: %s%s\n", buffer3, buffer4);
+
+    rs_diag(ri);
+
+    ret = rs_deprecate(ri, key1, id1);
+    if(ret != 0)
+    {
+        fprintf(stderr, "Error: rs_deprecate() failure.\n");
+        return(-1);
+    }
+
+    ret = rs_deprecate(ri, key1, id1);
+    if(ret != 0)
+    {
+        fprintf(stderr, "Error: rs_deprecate() failure.\n");
+        return(-1);
+    }
+
+    rs_diag(ri);
+
+    rs_finalize(ri);
+
+    return 0;
+}
+aesop_main_set(aesop_main);
+
+/*
+ * Local Variables:
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

@@ -1,0 +1,18 @@
+#ifndef __AEIDB_HAE__
+#define __AEIDB_HAE__
+
+#include <idb.h>
+
+extern __blocking IDBX aeidb_begin(IDBC c);
+extern __blocking int aeidb_precommit(IDBX idbx);
+extern __blocking int aeidb_end(IDBX idbx, int commit);
+extern __blocking int aeidb_insert(IDBX idbx, IDB idb,
+				   struct idb_interval *iv);
+extern __blocking int aeidb_remove(IDBX idbx, IDB idb,
+				   struct idb_interval *iv);
+extern __blocking int aeidb_stab(IDBX idbx, IDB idb, struct idb_interval *iv,
+				 __blocking int (*f)
+				 (const struct idb_interval *, void *),
+				 void *arg);
+extern __blocking char *aeidb_next(IDBX idbx, char *path, unsigned flags);
+#endif

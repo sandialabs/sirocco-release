@@ -1,0 +1,31 @@
+./prepare.sh
+./configure
+make
+make install
+
+Thanks to Argonne, as their examples form the bulk of autotools
+support here.
+
+Known issues:
+- CPPFLAGS does not work. Use CFLAGS instead.
+- You will get warnings from system headers, notably those from
+  -Wmissing-prototypes.
+- Everything in this package will compile with -D_BSD_SOURCE and
+  -DDB_DBM_HSEARCH=0. The AESOP compile rules don't listen to
+  -per-target flags.
+
+Berkeley DB Snapshot support
+---
+Please use one of the following, in order of preference:
+
+- Use the libdb-6.1.20 development package from your distribution, or
+  compile your own.
+- Compile your own libdb-6.1.19 with the following patch:
+     patch <your-db-sources>/src/btree/bt_search.c \
+     <your-hoss-path>/maint/db-6.1.19-snapshot-isolation-2739213.diff
+  Note that Aesop should configured/built against this libdb for HOSS
+  to benefit from the patch. Then use the
+  --enable-bdb-snapshot-isolation to configure HOSS.
+- Use the libdb-5.1 (or greater) development package from your
+  distribution. Note that certain workloads will cause errors,
+  specifically that BDB has run out of locks.

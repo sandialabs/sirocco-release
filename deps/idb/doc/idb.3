@@ -1,0 +1,15 @@
+.\" Process this file with groff -man -Tascii foo.1
+.\"
+.TH IDB 3 "APRIL 2014" "Linux/OS X" "API Documentation"
+.SH NAME
+IDB - The Interval Database Library
+
+.SH DESCRIPTION
+The Interval Database (IDB) library manages an index of
+non-overlapping intervals, as well as ancilliary data including update
+IDs, record lengths, log offsets, and flags. While not a full-featured
+database, the IDB is mainly useful for managing log-structured and
+byte-granular storage.
+
+.SH SEE ALSO
+idb_init(3), idb_open(3), idb_close(3), idb_begin(3), idb_end(3), idb_insert(3), idb_remove(3), idb_stab(3)

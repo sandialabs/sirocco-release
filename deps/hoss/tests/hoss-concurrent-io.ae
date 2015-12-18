@@ -1,0 +1,248 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <sys/time.h>
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <hoss.hae>
+
+/* NOTE: this test program is meant to stream concurrent I/O operations to
+ * HOSS in order to test robustness and performance.
+ *
+ * TODO: read support (this benchmark currently only does writes)
+ * TODO: possibly add more options to support different access patterns
+ */
+
+/* example execution, issuing 4 MiB write operations with 8-way concurrency
+ * for up to 10 seconds:
+ *
+ * ./hoss-concurrent-io 4194304 8 10.0
+ */
+
+/* maximum number of IO ops to execute in benchmark */
+#define RS_MAX_OPS (2*1024*1024)
+
+/* describes the workload to be executed */
+struct workload_state
+{
+    struct hoss_oid oid;
+    hoss_off_t starts[RS_MAX_OPS];
+    int count;
+    int count_done;
+    int index;
+};
+
+/* pre-define the I/O accesses to be performed in one big array */
+/* NOTE: we could reorder or shuffle this as needed to test different
+ * patterns
+ */
+static void setup_workload(struct workload_state* wkld, size_t buffer_sz)
+{
+    int i;
+
+    wkld->oid.nids =  3; /* collection/object/fork */
+    wkld->oid.ids = malloc(sizeof(*wkld->oid.ids) * 3);
+    assert(wkld->oid.ids);
+    /* for now we test accessing a single collection/object/fork */
+    wkld->oid.ids[0]=  1;
+    wkld->oid.ids[1]=  1;
+    wkld->oid.ids[2]=  0;
+
+    wkld->count = RS_MAX_OPS;
+    wkld->index = 0;
+    wkld->count_done = 0;
+
+    /* pick a unique starting offset for each set of records (sequential for
+     * now)
+     */
+    for(i=0; i<RS_MAX_OPS; i++)
+    {
+        wkld->starts[i] = buffer_sz * (hoss_off_t)i;
+    }
+}
+
+/* allocate buffers to be used for all I/O operations, one per pbranch */
+static char** setup_buffers(size_t buffer_sz, int concurrency)
+{
+    char** array_of_bufs;
+    int i, j;
+
+    array_of_bufs = malloc(sizeof(char*) * concurrency);
+    assert(array_of_bufs);
+
+    for(i=0; i<concurrency; i++)
+    {
+        array_of_bufs[i] = malloc(sizeof(char)*buffer_sz);
+        assert(array_of_bufs[i]);
+        /* initialize every byte of every buffer to get it paged in */
+        for(j=0; j<buffer_sz; j++)
+        {
+            array_of_bufs[i][j] = '1';
+        }
+    }
+
+    return(array_of_bufs);
+}
+
+static double Wtime(void)
+{
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return((double)t.tv_sec + (double)(t.tv_usec) / 1000000);
+}
+
+__blocking int aesop_main(int argc, char **argv)
+{
+    int ret;
+    struct workload_state wkld;
+    const char* buffer = NULL;
+    size_t buffer_sz;
+    double max_time;
+    int concurrency;
+    char** buffers;
+    double start, end;
+    pthread_mutex_t wkld_mutex;
+    double ops_s;
+    double MB_s;
+    struct hoss_ctx *hoss_ctx;
+
+    if(argc != 4)
+    {
+        fprintf(stderr, "Usage: hoss-concurrent-io <access_size_in_bytes> <concurrency> <max_benchmark_time_in_floating_point_seconds>\n");
+        return(-1);
+    }
+
+    ret = sscanf(argv[1], "%zd", &buffer_sz);
+    if(ret != 1)
+    {
+        /* TODO: usage error */
+        return(-1);
+    }
+
+    ret = sscanf(argv[2], "%d", &concurrency);
+    if(ret != 1)
+    {
+        /* TODO: usage error */
+        return(-1);
+    }
+
+    ret = sscanf(argv[3], "%lf", &max_time);
+    if(ret != 1)
+    {
+        /* TODO: usage error */
+        return(-1);
+    }
+
+    ret = hoss_init(&hoss_ctx, ".");
+    if(ret != 0)
+    {
+        fprintf(stderr, "Error: hoss_init()\n");
+        return(-1);
+    }
+
+    /* prepare workload description and memory buffers */
+    setup_workload(&wkld, buffer_sz);
+    buffers = setup_buffers(buffer_sz, concurrency);
+
+    /* start timing */
+    start = Wtime();
+
+    pwait
+    {
+        pprivate int i;
+        pprivate int branch_ret, iorc;
+        pprivate int branch_index = 0;
+        pprivate struct hoss_grp *grp;
+        pprivate hoss_size_t tfer;
+
+        for(i=0; i<concurrency; i++)
+        {
+            pbranch
+            {
+                while(branch_index < RS_MAX_OPS)
+                {
+                    pthread_mutex_lock(&wkld_mutex);
+
+                    /* determine what operation we are supposed to issue */
+                    branch_index = wkld.index;
+                    wkld.index++;
+
+                    /* periodically check time limit */
+                    if((wkld.index % 100) == 0)
+                    {
+                        end = Wtime();
+                        if(end - start > max_time)
+                            wkld.index = RS_MAX_OPS;
+                    }
+
+                    pthread_mutex_unlock(&wkld_mutex);
+
+                    /* have we run out of ops? */
+                    if(branch_index >= RS_MAX_OPS)
+                    {
+                        break;
+                    }
+
+                    branch_ret = hoss_begin(&grp, NULL, 0, hoss_ctx);
+                    assert(branch_ret == 0);                
+                    
+                    /* write */
+                    branch_ret = hoss_write(
+                        &wkld.oid, //struct hoss_oid *oid,
+                        wkld.starts[branch_index],     //hoss_off_t start,
+                        buffer_sz,    //hoss_size_t nrecs,
+                        1,       //hoss_size_t reclen,
+                        0,       //hoss_flags_t flags,
+                        0,       //hoss_update_t update_condition,
+                        1,       //hoss_update_t new_update,
+                        buffers[i],     //const void *writebuf,
+                        grp,    //struct hoss_grp *grp,
+                        &tfer,     //hoss_size_t *transferred,
+			&iorc);  //int *rc
+                    assert(buffer_sz == tfer && branch_ret == 0);
+
+                    branch_ret = hoss_end(grp, 1);
+                    assert(branch_ret == 0 && iorc == 0);
+
+                    pthread_mutex_lock(&wkld_mutex);
+                    wkld.count_done++;
+                    pthread_mutex_unlock(&wkld_mutex);
+
+                }
+
+            }
+        }
+    }
+
+    end = Wtime();
+
+    hoss_fini(hoss_ctx);
+
+    ops_s = (double)wkld.count_done;
+    ops_s /= (end-start);
+
+    MB_s = (double)wkld.count_done * (double)buffer_sz;
+    MB_s /= (1024.0 *1024.0);
+    MB_s /= (end-start);
+
+    printf("ops_completed: %d\n", wkld.count_done);
+    printf("ops_second: %f\n", ops_s);
+    printf("MiBs_second: %f\n", MB_s);
+
+    return 0;
+}
+aesop_main_set(aesop_main);
+
+/*
+ * Local Variables:
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

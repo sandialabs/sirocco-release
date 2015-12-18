@@ -1,0 +1,68 @@
+The IDB Library
+---
+Compilation notes:
+- Two libraries can be built.
+  * libaeidb.a - The IDB library, with C and Aesop support
+  * libidb.a - The IDB library, with only C support.
+- The USE_EXCESSIVE_GCC_WARNINGS environment variable, when defined,
+  will use lots of warnings when building plain-C files. Aesop files
+  are never subject to this level of rigor.
+
+Use notes:
+- To work with IDBs, the IDB library has to be initialized with
+  idb_init. Call idb_fini when finished. It is safe for each component
+  that uses IDB to do this. A current limitation is that all
+  initializations should use the same environment path.
+- No coelescing is done. No version checking is done.
+- This entire implementation requires that all intervals lie
+  completely within the range addressable by idb_off_t, which is
+  defined to be signed. If an interval does not follow this
+  assumption, insert, remove, and stab will return an error with errno
+  EDOM.
+- bdb requires use of an environment space. By default, it resides in
+  $PWD. If you want that changed, set the global variable defined in
+  idb.h called idb_env_path to your desired path BEFORE your first IDB
+  call. See TODO. IDB will not make any directories on your behalf.
+- Internally, error codes are returned instead of using errno. To be
+  nice, since the old IDB used errno, this library will also set errno
+  before returning.
+- IDB may return IDB_RESTART. Recovering requires shutting down all
+  handles and the context completely.
+- IDB may return IDB_DEADLOCK if the underlying DB environment
+  deadlocks. This is a catastrophic error for the transaction. It
+  must be aborted and retried.
+- Precommits are really, really slow. Don't do them unless you have
+  to. Because a transaction can span multiple IDBs in a single
+  context, you don't have to do a precommit to atomically update
+  multiple IDBs.
+- There is a checkpoint thread that allows work to build up (durably)
+  before updating the database. This will cause some unevenness in
+  performance occasionally, depending on when you catch the thread
+  doing work, but results in overall performance gains. The global
+  variable idb_checkpoint_interval can be set to the number of seconds
+  between checkpoints. A checkpoint will always happen before normal
+  application exit.
+- Rumor has it that Valgrind could complain about uninitialized memory
+  within bdb. Similar rumors state that building bdb with
+  --enable-umrw will make these warnings go away, but I haven't tried
+  it. Ref: https://community.oracle.com/thread/1004183?tstart=0
+- A function called idb_next will provide a search facility to iterate
+  over databases stored in the environment. This is only useful if
+  IDB_SHARED is defined. Use the IDB_NEXT_EXCL flag if the searched
+  identifier should not be returned if present.
+
+TODO:
+- Better management of environment. Right now, you should only be
+  using one environment in a program.
+- Put in coelescing.
+- (fuzz) Tests! (performance) Tests! (correctness) Tests!
+- Precommit tx_ids need some work, including with recovery.
+- Make a function to force IDB to synchronously checkpoint, for timing
+  purposes.
+- Provide IDB error functions to get error strings, as libdb or errno
+  codes can be returned.
+- Make sure that all functions that can return DB_LOCK_DEADLOCK are
+  handled appropriately.
+- Documentation
+- Make sure error paths are correct, with commits disabled if things
+  go wrong in places like do_insert.

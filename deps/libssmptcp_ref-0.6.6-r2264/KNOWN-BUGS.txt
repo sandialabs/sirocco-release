@@ -1,0 +1,14 @@
+0.6.6
+-----
+No known outstanding issues.
+
+
+0.6.5.1
+-------
+Large numbers of exactly concurrent connections may exceed the hardcoded cache
+size; this will be addressed in a future release.
+
+0.6.5
+-----
+Large numbers of exactly concurrent connections may exceed the hardcoded cache
+size; this will be addressed in a future release.

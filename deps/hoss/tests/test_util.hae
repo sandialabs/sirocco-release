@@ -1,0 +1,18 @@
+#ifndef _HOSS_TEST_UTIL_HAE_
+#define _HOSS_TEST_UTIL_HAE_
+
+#include <sys/time.h>
+
+__blocking int
+get_empty_oid(struct hoss_oid **_oid, struct hoss_grp *g,
+	      struct hoss_ctx *ctx);
+
+/* Stick file and line format at front, so there's at least that,
+   along with a final empty arg, so there's something for __VA_ARGS__
+   to grab onto. */
+#define ERR(...) ERR2("%s:%i " __VA_ARGS__, "")
+/* Put in a %s at the end of format to take the empty string we tacked
+   on at end above. */
+#define ERR2(fmt, ...) fprintf(stderr, fmt "%s", __FILE__, __LINE__, __VA_ARGS__)
+
+#endif

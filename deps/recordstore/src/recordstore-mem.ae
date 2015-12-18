@@ -1,0 +1,306 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#include <stdio.h>
+#include <pthread.h>
+
+#include <aesop/aesop.h>
+#include <triton-hash.h>
+#include <recordstore.hae>
+
+#include "recordstore-method.hae"
+
+static void* mem_init(const char* params);
+static __blocking int mem_write(void* method_data, rs_key_t key, 
+    const void* buffer, size_t nbytes, rs_id_t* out_id);
+static __blocking int mem_read(void* method_data, rs_key_t key, 
+    rs_id_t id, void* buffer, size_t nbytes, off_t relative_offset);
+static __blocking int mem_deprecate(void* method_data, rs_key_t key, 
+    rs_id_t id);
+static __blocking int mem_flush(void* method_data, rs_key_t key, rs_id_t id);
+static void mem_diag(void* method_data);
+static void mem_finalize(void* method_data);
+
+struct recordstore_method rs_mem_method = 
+{
+    .name = "memory",
+    .init = mem_init,
+    .write = mem_write,
+    .read = mem_read,
+    .deprecate = mem_deprecate,
+    .flush = mem_flush,
+    .diag = mem_diag,
+    .finalize = mem_finalize,
+};
+
+struct mem_method_data
+{
+    /* incoming writes will be grouped into separate memory allocation logs
+     * according to the first key_prefix_bytes of the key.
+     */
+    int key_prefix_bytes;
+    int total_alloc_size; /* total amount of memory allocated */
+    int total_real_used; /* total amount of memory actually used (not deprecated) */
+    struct triton_hash_table *log_table; /* hash table of logs */
+    pthread_mutex_t mutex; /* protect concurrent access */
+};
+
+/* An in-memory log to store data in.  Will be re-allocated as needed. */
+struct mem_log
+{
+    rs_key_t prefix; /* only use first key_prefix_bytes */
+    char* log; /* data */
+    int alloc_size; /* size of current allocation */ 
+    int alloc_used; /* amount of current allocation actually used */
+    int real_used; /* amount of allocation that has not been deprecated */
+    struct triton_hash_link hash_link; /* link into hash table */
+};
+
+static int log_compare(const void *k, struct triton_hash_link *l);
+static int log_key_hash(const void *k, int table_size);
+static void log_free(struct mem_log *entry);
+
+static void* mem_init(const char* params)
+{
+    struct mem_method_data *data;
+    char* param_idx;
+
+    data = malloc(sizeof(*data));
+    if(!data)
+        return(NULL);
+    memset(data, 0, sizeof(*data));
+ 
+    data->log_table = triton_hash_init(log_compare, log_key_hash, 1024);
+    if(!data->log_table)
+    {
+        free(data);
+        return(NULL);
+    }
+
+    pthread_mutex_init(&data->mutex, NULL);
+
+    if(params)
+    {
+        param_idx = strstr(params, "key_prefix_bytes:");
+        if(param_idx)
+            sscanf(param_idx, "key_prefix_bytes:%d", &data->key_prefix_bytes);
+    }
+
+    if(!data->key_prefix_bytes)
+        data->key_prefix_bytes = 16; /* default value if not specified */
+   
+    return(data);
+}
+
+static __blocking int mem_write(void* method_data, rs_key_t key, 
+    const void* buffer, size_t nbytes, rs_id_t* out_id)
+{
+    struct mem_method_data *data = method_data;
+    rs_key_t prefix;
+    struct triton_hash_link *result;
+    struct mem_log *log;
+
+    /* find appropriate log based on the first key_prefix_bytes of the key */
+    memset(&prefix, 0, sizeof(prefix));
+    memcpy(prefix.data, key.data, data->key_prefix_bytes);
+
+    /* relatively coarse-grained locking; these memory operations are going
+     * to be quick, though.
+     */
+    pthread_mutex_lock(&data->mutex);
+
+    result = triton_hash_search(data->log_table, &prefix);
+    if(!result)
+    {
+        /* add new log */
+        log = malloc(sizeof(*log));
+        if(!log)
+        {
+            pthread_mutex_unlock(&data->mutex);
+            return(-1);
+        }
+        memset(log, 0, sizeof(*log));
+        log->prefix = prefix;
+        /* start with 1 MB allocation minimum */
+        if(nbytes < 1024*1024)
+            log->alloc_size = 1024*1024;
+        else
+            log->alloc_size = nbytes; 
+        data->total_alloc_size += log->alloc_size;
+        log->log = malloc(log->alloc_size);
+        if(!log->log)
+        {
+            free(log);
+            pthread_mutex_unlock(&data->mutex);
+            return(-1);
+        }
+        triton_list_link_clear(&log->hash_link);
+        triton_hash_add(data->log_table, &prefix, &(log->hash_link));
+    }
+    else
+    {
+        log = triton_hash_get_entry(result, struct mem_log, hash_link);
+        /* see if we have enough memory */
+        if(nbytes > log->alloc_size - log->alloc_used)
+        {
+            int new_size;
+
+            /* expand, with 25% spare space beyond what's needed */
+            new_size = log->alloc_used + nbytes +((log->alloc_used+nbytes)/4);
+            log->log = realloc(log->log, new_size);
+            if(!log->log)
+            {
+                /* TODO: problem here: this realloc tends to fail due to
+                 * being asked to allocate a negative number of bytes.
+                 * Probably the integer types are too small, and the code
+                 * also needs a cap on how much memory it will consume.
+                 */
+                pthread_mutex_unlock(&data->mutex);
+                return(-1);
+            }
+            data->total_alloc_size += (new_size-log->alloc_size);
+            log->alloc_size = new_size;
+        }
+    }
+
+    /* at this point in the code, we have found the correct log and it has
+     * enough room to hold the write */
+
+    memcpy(&log->log[log->alloc_used], buffer, nbytes);
+    
+    /* assign id, with log pointer, log offset, and size */
+    memset(out_id, 0, sizeof(*out_id));
+    memcpy(&out_id->data[0], &log, sizeof(struct mem_log*));
+    memcpy(&out_id->data[8], &log->alloc_used, sizeof(log->alloc_used));
+    memcpy(&out_id->data[16], &nbytes, sizeof(nbytes));
+
+    /* increment counters */
+    log->alloc_used += nbytes;
+    log->real_used += nbytes;
+    data->total_real_used += nbytes;
+
+    pthread_mutex_unlock(&data->mutex);
+    return(0);
+}
+
+static __blocking int mem_read(void* method_data, rs_key_t key, 
+    rs_id_t id, void* buffer, size_t nbytes, off_t relative_offset)
+{
+    struct mem_method_data *data = method_data;
+    struct mem_log *log;
+    int log_offset;
+
+    /* get log and offset out of id */
+    memcpy(&log, &id.data[0], sizeof(struct mem_log*));
+    memcpy(&log_offset, &id.data[8], sizeof(log_offset));
+
+    log_offset += relative_offset;
+
+    pthread_mutex_lock(&data->mutex);
+    memcpy(buffer, &log->log[log_offset], nbytes);
+    pthread_mutex_unlock(&data->mutex);
+
+    return(0);
+}
+
+static __blocking int mem_deprecate(void* method_data, rs_key_t key, 
+    rs_id_t id)
+{
+    struct mem_method_data *data = method_data;
+    struct mem_log *log;
+    int log_offset;
+    size_t nbytes;
+
+    /* get log, offset, and size out of id */
+    memcpy(&log, &id.data[0], sizeof(struct mem_log*));
+    memcpy(&log_offset, &id.data[8], sizeof(log_offset));
+    memcpy(&nbytes, &id.data[16], sizeof(nbytes));
+
+    pthread_mutex_lock(&data->mutex);
+
+    /* decrement count of how many bytes are really used in the log */
+    log->real_used -= nbytes;
+    data->total_real_used -= nbytes;
+
+    /* if the log no longer contains any non-deprecated data then we free
+     * the whole thing
+     */
+    if(log->real_used == 0)
+    {
+        triton_list_del(&log->hash_link);
+        data->total_alloc_size -= log->alloc_size;
+        free(log->log);
+        free(log);
+    }
+
+    pthread_mutex_unlock(&data->mutex);
+
+    return(0);
+}
+
+static __blocking int mem_flush(void *method_data, rs_key_t key, rs_id_t id)
+{
+    struct mem_method_data *data = method_data;
+
+    /* noop; there is nowhere to flush memory to */
+    return(0);
+}
+
+static void mem_diag(void* method_data)
+{
+    struct mem_method_data *data = method_data;
+
+    printf("# Diagnostics for recordstore \"memory\" with method_data %p:\n", method_data);
+    printf("#   key_prefix_bytes: %d\n", data->key_prefix_bytes);
+    printf("#   total_alloc_size: %d\n", data->total_alloc_size);
+    printf("#   total_real_used: %d\n", data->total_real_used);
+
+    return;
+}
+
+static void mem_finalize(void* method_data)
+{
+    struct mem_method_data *data = method_data;
+
+    pthread_mutex_destroy(&data->mutex);
+    triton_hash_destroy_and_finalize(data->log_table, struct mem_log, hash_link, log_free);
+    free(data);
+
+    return;
+}
+
+static int log_compare(const void *k, struct triton_hash_link *l)
+{
+    const rs_key_t *key = (const rs_key_t *)k;
+    struct mem_log *val = triton_hash_get_entry(l, struct mem_log, hash_link);
+
+    return(!memcmp(key, &val->prefix, sizeof(*key)));
+}
+
+static int log_key_hash(const void *k, int table_size)
+{
+    uint32_t h1 = 0, h2 = 0;
+    const rs_key_t *key = (const rs_key_t *)k;
+    bj_hashlittle2(key, sizeof(*key), &h1, &h2);
+    return(h1%table_size);
+}
+
+static void log_free(struct mem_log *entry)
+{
+    free(entry->log);
+    free(entry);
+
+    return;
+}
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

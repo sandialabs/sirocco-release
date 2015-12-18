@@ -1,0 +1,88 @@
+#ifndef _HOSS_INTERNAL_HAE_
+#define _HOSS_INTERNAL_HAE_
+
+#include <recordstore.hae>
+#include <hoss.hae>
+
+/***
+ * Internal API
+ ***/
+rs_key_t _hoss_oid_to_key(struct hoss_oid *oid);
+size_t _hoss_oid_to_ch(struct hoss_oid *id, char *dst, size_t sz);
+int _hoss_alloc_oid_to_ch(struct hoss_oid *id, char **dst);
+
+/* Returns 1 if interval is valid to be stored in HOSS, 0
+   otherwise. */
+int _hoss_is_in_range(struct idb_interval *iv);
+
+/* Obtain an IDBX to work within */
+__blocking IDBX _hoss_idbx_get(struct hoss_grp *g);
+
+/* _hoss_idbx_put: Surrender an IDBX */
+__blocking int _hoss_idbx_put(struct hoss_grp *g, int flags);
+#define END_OF_GRP (1 << 1) /* Force commit when usually delayed per MSYNC */
+#define COMMIT     (1 << 2) /* Specify to indicate success of operation */
+
+/***
+ * Internal structures
+ ***/
+struct hoss_op {
+	__blocking int (*prep)(struct hoss_op *op);
+	__blocking int (*exec)(struct hoss_op *op);
+	__blocking int (*finish)(struct hoss_op *op);
+	__blocking int (*rollback)(struct hoss_op *op);
+	__blocking int (*cleanup)(struct hoss_op *op);
+	struct hoss_grp *parent;
+	unsigned prepped:1;
+	unsigned execed:1;
+
+	TAILQ_ENTRY(hoss_op) ops;
+	char vargs[];
+};
+
+struct hoss_ctx {
+	rs_instance_t rs;
+	IDBC idbc;
+};
+
+/* Status flags */
+#define _HOSS_WRERROR (1 << 0)
+#define _HOSS_RDERROR (1 << 1)
+
+struct hoss_grp {
+	struct hoss_ctx *hoss;
+	struct hoss_grp *parent;
+	IDBX idbx;
+	hoss_flags_t flags;
+	unsigned status;
+	struct idb_cache *dbs;
+
+	unsigned my_tx:1;
+
+	TAILQ_HEAD(op_list, hoss_op) deferred_ops;
+};
+
+#define STRINGIFY2(x) #x
+#define STRINGIFY(x) STRINGIFY2(x)
+
+#define PRINT_STATUS(force, prepend, ...)			\
+	fprintf(stderr, prepend __FILE__ ","                    \
+		STRINGIFY(__LINE__)                             \
+		": " __VA_ARGS__)
+
+#define SWARN(...)
+
+#define WARN(...) do {						\
+		PRINT_STATUS(1, "HOSS WARNING @", __VA_ARGS__);	\
+        } while(0)
+
+#define ERR(...) do {						\
+		PRINT_STATUS(1, "HOSS ERROR @", __VA_ARGS__);	\
+        } while(0)
+
+#define INFO(...) do {						\
+		PRINT_STATUS(1, "HOSS INFO @", __VA_ARGS__);	\
+        } while(0)
+
+#endif
+

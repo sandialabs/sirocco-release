@@ -1,0 +1,21 @@
+INSTALLATION NOTES
+
+This distribution was generated with GNU AutoTools, meaning that it supports
+the full range of options typically offered.
+
+Note that this release has only been tested when statically linked.
+
+Installation will use the Autotools default user library and header
+directories on your system.
+
+Basic installation:
+
+  ./configure
+  make install
+
+To enable debug messaging (perhaps to help the developers), instead do:
+
+  ./configure CFLAGS="-DSSMPP_OUT_VVERBOSE"
+  make install
+
+

@@ -1,0 +1,153 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include <aesop/aesop.h>
+#include <recordstore.hae>
+#include "recordstore-method.hae"
+
+/* function pointers and data for a given recordstore instantiation */
+struct rs_instance
+{
+    struct recordstore_method* method;
+    void* method_data;
+};
+
+/* array of underlying methods that can be intialized by caller */
+extern struct recordstore_method rs_mem_method;
+extern struct recordstore_method rs_file_method;
+#ifdef HAVE_KINETIC
+extern struct recordstore_method rs_kinetic_method;
+#endif
+struct recordstore_method* method_array[] = 
+{
+    &rs_mem_method,
+    &rs_file_method,
+#ifdef HAVE_KINETIC
+    &rs_kinetic_method,
+#endif
+    NULL,
+};
+
+rs_instance_t rs_init(const char* method, const char* params)
+{
+    int idx = 0;
+    struct rs_instance *ri;
+
+    ri = malloc(sizeof(*ri));
+    if(!ri)
+    {
+        return(NULL);
+    }
+
+    while(method_array[idx] != NULL)
+    {
+        if(strcmp(method_array[idx]->name, method) == 0)
+        {
+            ri->method = method_array[idx];
+            ri->method_data = method_array[idx]->init(params);
+            if(ri->method_data)
+                return(ri);
+            else
+            {
+                free(ri);
+                return(NULL);
+            }
+        }
+        idx++;
+    }
+    free(ri);
+    return(NULL);
+}
+
+__blocking int rs_write(rs_instance_t ri, rs_key_t key, const void* buffer,
+   size_t nbytes, rs_id_t* out_id)
+{
+    int ret;
+    /* TODO: open up an aesop trac ticket.  The __blocking function pointer
+     * invocation doesn't work if you try to call ri->method->flush instead
+     * of method->flush.  Something about the extra level of pointer
+     * indirection throws it off.
+     */
+    struct recordstore_method *method = ri->method;
+
+    ret = method->write(ri->method_data, key, buffer, nbytes, out_id);
+    return(ret);
+}
+
+__blocking int rs_read(rs_instance_t ri, rs_key_t key, rs_id_t id,
+   void* buffer, size_t nbytes, off_t relative_offset)
+{
+    int ret;
+    /* TODO: open up an aesop trac ticket.  The __blocking function pointer
+     * invocation doesn't work if you try to call ri->method->flush instead
+     * of method->flush.  Something about the extra level of pointer
+     * indirection throws it off.
+     */
+    struct recordstore_method *method = ri->method;
+
+    ret = method->read(
+        ri->method_data, key, id, buffer, nbytes, relative_offset);
+
+    return(ret);
+}
+
+__blocking int rs_deprecate(rs_instance_t ri, rs_key_t key, rs_id_t id)
+{
+    int ret;
+    /* TODO: open up an aesop trac ticket.  The __blocking function pointer
+     * invocation doesn't work if you try to call ri->method->flush instead
+     * of method->flush.  Something about the extra level of pointer
+     * indirection throws it off.
+     */
+    struct recordstore_method *method = ri->method;
+
+    ret = method->deprecate(
+        ri->method_data, key, id);
+
+    return(ret);
+}
+
+__blocking int rs_flush(rs_instance_t ri, rs_key_t key, rs_id_t id)
+{
+    int ret;
+    /* TODO: open up an aesop trac ticket.  The __blocking function pointer
+     * invocation doesn't work if you try to call ri->method->flush instead
+     * of method->flush.  Something about the extra level of pointer
+     * indirection throws it off.
+     */
+    struct recordstore_method *method = ri->method;
+
+    ret = method->flush(ri->method_data, key, id);
+    return(ret);
+}
+
+void rs_diag(rs_instance_t ri)
+{
+    ri->method->diag(ri->method_data);
+
+    return;
+}
+
+void rs_finalize(rs_instance_t ri)
+{
+    ri->method->finalize(ri->method_data);
+    free(ri);
+
+    return;
+}
+
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

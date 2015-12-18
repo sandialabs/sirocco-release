@@ -1,0 +1,18 @@
+
+testlib = src/librecordstore.a
+
+check_PROGRAMS += \
+ tests/recordstore-basic \
+ tests/recordstore-bench-write
+
+TESTS += \
+ tests/recordstore-basic-file.sh \
+ tests/recordstore-basic-memory.sh
+
+tests_recordstore_basic_LDADD = $(testlib)
+tests_recordstore_basic_SOURCES = tests/recordstore-basic.ae
+AE_SRC += tests/recordstore-basic.ae
+
+tests_recordstore_bench_write_LDADD = $(testlib)
+tests_recordstore_bench_write_SOURCES = tests/recordstore-bench-write.ae
+AE_SRC += tests/recordstore-bench-write.ae

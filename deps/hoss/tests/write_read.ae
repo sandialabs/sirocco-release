@@ -1,0 +1,101 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <assert.h>
+#include <stdio.h>
+#include <sys/time.h>
+
+#include <hoss.hae>
+#include <idb_dbg.h>
+
+static uint64_t
+get_time64()
+{
+	uint64_t ret;
+	struct timeval tv;
+	int rc;
+
+	rc = gettimeofday(&tv, NULL);
+	assert(rc == 0);
+
+	ret = (tv.tv_sec << 32) + tv.tv_usec;
+	return ret;
+}
+
+static __blocking int
+write_read_cycle(hoss_flags_t f, struct hoss_ctx *hoss)
+{
+	int rc, orc[2];
+	hoss_eid_t eid, reid;
+	struct hoss_oid oid;
+	hoss_size_t nb;
+	struct hoss_grp *g;
+
+	oid.nids = 1;
+	oid.ids = &eid;
+
+	do {
+		rc = hoss_begin(&g, NULL, f, hoss);
+		if (rc == 0) {
+			eid = get_time64();
+			rc = hoss_write(&oid, 0, sizeof(eid), 1, 0, 0, 1,
+					&eid, g, &nb, &orc[0]);
+			if (rc == 0) {
+				rc = hoss_read(&oid, 0, sizeof(eid), f, 0,
+					      &reid, sizeof(eid), NULL, 0, g,
+					      &nb, NULL, NULL, &orc[1]);
+			}
+		}
+		if (rc == 0) {
+			rc = hoss_end(g, 1);
+		} else {
+			(void)hoss_end(g, 0);
+		}
+	} while(0);
+
+	if (rc != 0) {
+		/* Nuffin' */
+	} else if (orc[0] != 0) {
+		rc = orc[0];
+	} else if (orc[1] != 0) {
+		rc = orc[1];
+	}
+	if (rc == 0) {
+		assert(reid == eid);
+		assert(nb == sizeof(eid));
+	}
+	return rc;
+}
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	int rc;
+	struct hoss_ctx *hoss;
+	hoss_flags_t f, limit;
+	size_t nddlks;
+
+	_idb_dbg_ddlk = 2;
+
+	limit = HOSS_GRP_FLAG_MASK;
+
+	rc = hoss_init(&hoss, ".");
+	assert(rc == 0);
+
+	nddlks = 0;
+	for (f = 0; f <= limit*16; f++) {
+		nddlks -= 1;
+		do {
+			rc = write_read_cycle(f & HOSS_GRP_FLAG_MASK, hoss);
+			nddlks += 1;
+		} while (_idb_dbg_ddlk && (f & HOSS_MSYNC) &&
+			 rc == IDB_DEADLOCK);
+		assert(rc == 0);
+	}
+	hoss_fini(hoss);
+	printf("Tested %i combinations, _idb_dbg_ddlk = %i, "
+	       "%lu deadlocks\n", f, _idb_dbg_ddlk, nddlks);
+	return 0;
+}
+
+aesop_main_set(aemain);

@@ -1,0 +1,20 @@
+sos/sos_prot.h sos/sos_prot.c: sos/sos_prot.x
+	       cd sos && rpcgen -h sos_prot.x > sos_prot.h ; \
+	       rpcgen -c sos_prot.x > sos_prot.c 
+
+sos/sos_prot.o: sos/sos_prot.h sos/sos_prot.c
+
+all: $(SOS_LIBNAME) $(SOS_TESTS)
+
+$(SOS_LIBNAME): $(SOS_LIBOBJS)
+		cp sos/asg.h include
+		cp sos/aasg.h include
+		cp sos/sos_prot.h include
+		ar cr $@ $^
+		ranlib $@
+
+$(SOS_TESTS): LDLIBS = -lssmptcp -lssm -lpthread -lrt
+$(SOS_TESTS): $(SXM_LIBNAME) $(SOS_LIBNAME)
+
+sos_clean:
+	rm -rf $(SOS_TESTS) $(SOS_LIBNAME) $(SOS_LIBOBJS) sos/*.o sos/sos_prot.c sos/sos_prot.h

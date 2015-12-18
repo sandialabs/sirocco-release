@@ -1,0 +1,96 @@
+#ifndef _ASG_EXEC_HAE_
+#define _ASG_EXEC_HAE_
+#include <sys/queue.h>
+#include <rpc/xdr.h>
+#include <ssm.h>
+#include <idb.h>
+
+#include "aasg_intnl.h"
+
+struct asgsvc {
+	struct hoss_ctx *hoss;
+};
+
+struct peer_record {
+	struct xm_transport *xmx;
+	ssm_Haddr address;
+};
+
+struct asgbatch {
+	TAILQ_HEAD(, asgop) ops;
+	struct hoss_grp *g;
+	struct peer_record p;
+	struct BATCH1res rc;
+	void *retbuf;
+	match1 ret;
+	struct aethread_group *t;
+	size_t len;
+};
+
+struct read_spec_args {
+	rinfo1 *p1;
+	struct hoss_record_info *p2;
+	size_t len;
+};
+
+union op_spec_args {
+	struct read_spec_args rs;
+};	
+
+struct asgop {
+	TAILQ_ENTRY(asgop) entries;
+	sosop1 op;
+	struct hoss_grp *g;
+	struct asgarg *arg;
+	int arg_present;
+	union op_spec_args ops;
+	void *bp[4];
+	size_t bps;
+	void *buf;
+	void *data;
+	struct peer_record *p;
+};
+
+struct asgarg {
+	ssm_Haddr address;
+	struct xm_transport *xmx;
+	struct msg_header msg_header;
+	union aasg_cooked c;
+	TAILQ_ENTRY(asgarg) entries;
+};
+
+/* Return values from asg_svc_fn entries to indicate handling */
+enum svc_act {
+	SVC_DROP = -1,
+	SVC_REPLY = 0,
+	SVC_FORWARD = 1, /* Forwards to whatever is in p, which may
+			    have changed */
+};
+
+enum svc_flags {
+	SVC_ADD_HEADER = 2,
+};
+
+/* A list of some functions that are called by the event loop. The
+   event loop will XDR arguments coming in via asgarg.request, and
+   will XDR the reply (or request) as needed.
+
+   Responsibilities:
+
+   * Will return SVC_REPLY, SVC_FORWARD, or SVC_DROP to dictate how to
+     handle the asgarg once complete.
+   * Will call xdr_free on the argument structure to destroy it, unless
+     returning SVC_FORWARD. Do not free the asgarg.
+*/
+typedef __blocking int (*asg_svc_fn)(struct asgarg *asgargs,
+				     struct peer_record *p, void *data);
+asg_svc_fn join_svc;
+asg_svc_fn sos_svc;
+asg_svc_fn sos_batch_cancel;
+
+__blocking int prealloc(struct asgop *op);
+__blocking int prefetch(struct asgop *op);
+__blocking int op_exec(struct asgop *op);
+__blocking void asg_putback(struct asgarg *asgargs, struct peer_record *p,
+			    void *data, xdrproc_t proc, enum svc_flags f);
+#endif

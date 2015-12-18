@@ -1,0 +1,49 @@
+/* Using Aesop with a C-library with callbacks has lots of
+ * limitations. One, callbacks cannot be in Aesop, only plain
+ * C. Second, callbacks cannot interact with the Aesop runtime by
+ * doing aesems, as this can commandeer the thread that could be
+ * dedicated to doing work in the library.
+ *
+ * This stuff lets you specify a chained callback that is executed in
+ * the context of the message passing system callback, as well as an
+ * Aesop function that is executed in a pbranch. Use the first to copy
+ * out the address in the message, and use the second to signal to
+ * yourself that the callback is complete.
+ *
+ * NOTE: Remember to use the data in the cb_proxy_data structure for
+ * your callbacks. The data in the message itself will be overwritten,
+ * and used for the proxy's purposes. TODO: This should change, it's
+ * stupid.
+ */
+
+struct cb_proxy_data {
+	void (*xm_chained_cb)(struct xm_transport *, struct xm_message *,
+			      struct cb_proxy_data *);
+	void (*ae_cb)(struct cb_proxy_data *);
+	union xm_data data;
+	TAILQ_ENTRY(cb_proxy_data) entries;
+};
+
+int cb_proxy_init(void);
+
+void cb_proxy_fini(void);
+
+/* Event loop for proxy service. Call does not return until signalled
+ * to stop. */
+__blocking void cb_proxy_service(void);
+
+/* Signal all pbranches in cb_proxy_service to stop, and prevents
+ * others from starting. */
+__blocking void cb_proxy_signal_stop(void);
+
+/* WARNING: The cb and data pointers in the message will be
+ * overwritten. Use cb_proxy_data for your data and callbacks.
+ */
+int cb_proxy_op(int (*xm_op)(struct xm_transport *,
+			     struct xm_message *),
+		struct xm_transport *xmx,
+		struct xm_message *m,
+		struct cb_proxy_data *d);
+
+/* Configures a message to use the cb_proxy machinery when activated */
+void cb_proxy_setup(struct xm_message *m, struct cb_proxy_data *d);

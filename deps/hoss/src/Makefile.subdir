@@ -1,0 +1,14 @@
+src_libhoss_a_SOURCES +=	\
+	src/idb_cache.c 	\
+	src/hoss.ae		\
+	src/internal.ae 	\
+	src/write.ae		\
+	src/grp.ae		\
+	src/read.ae
+
+AE_SRC += \
+	src/hoss.ae		\
+	src/internal.ae		\
+	src/write.ae		\
+	src/grp.ae		\
+	src/read.ae

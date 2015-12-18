@@ -1,0 +1,384 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <aeidb.hae>
+#include <errno.h>
+
+#include "internal.hae"
+#include "idb_cache.h"
+
+struct hoss_read_ctx {
+        struct hoss_oid *oid;
+        hoss_off_t start;
+        hoss_size_t nrecs;
+        hoss_flags_t flags;
+        hoss_update_t update_condition;
+
+	struct hoss_record_info *info;
+	hoss_size_t info_max;
+
+	hoss_size_t info_count_val;
+	hoss_size_t *info_count_dst;
+
+        void *buf;
+        hoss_size_t byte_max;
+
+	hoss_size_t byte_count_val;
+        hoss_size_t *byte_count_dst;
+
+	hoss_update_t update_info_val;
+	hoss_update_t *update_info_dst;
+
+	int *rc;
+};
+
+struct iv_agg_inout {
+	size_t maxivs;
+	size_t nivs;
+	struct idb_interval *ivs;
+	struct idb_interval *goal;
+};
+
+/* Determine if, given the group flags and read arguments, an interval
+ * can be read without error. */
+static int
+is_iv_valid(struct hoss_grp *grp, struct hoss_read_ctx *r,
+	    struct idb_interval *iv, idb_off_t next)
+{
+	if (next != iv->rec &&
+	    (grp->flags & HOSS_SPARSE) == 0) {
+		ERR("Trying a continuous read in a sparse "
+		    "object (need %lu, have %lu\n",
+		    next, iv->rec);
+		return ENOTTY;
+	}
+	if (iv->size * iv->reclen + r->byte_count_val > r->byte_max) {
+		ERR("Byte_Max mismatch - The full read will "
+		    "not fit in the buffer given\n");
+		return ENOSPC;
+	}
+	return 0;
+}
+
+__blocking static int
+iv_agg(const struct idb_interval *civ, void *arg)
+{
+	struct iv_agg_inout *agg;
+	struct idb_interval miv;
+	size_t diff;
+
+	agg = arg;
+
+	if (agg->nivs == agg->maxivs)
+		return 0;
+
+	miv = *civ;
+
+	/* trim iv as appropriate */
+	if (agg->goal->rec > miv.rec) {
+		diff = agg->goal->rec - miv.rec;
+		miv.rec += diff;
+		miv.log_offset += diff;
+		miv.size -= diff;
+	}
+	if (agg->goal->rec + agg->goal->size < miv.rec + miv.size) {
+		diff = (miv.rec + miv.size) -
+			(agg->goal->rec + agg->goal->size);
+		miv.size -= diff;
+	}
+	agg->ivs[agg->nivs++] = miv;
+	return 1;
+}
+
+static __blocking int
+read_region(struct hoss_ctx *hoss, struct hoss_oid *oid, struct idb_interval *iv,
+	    void *buf)
+{
+	int rc;
+
+	rc = rs_read(hoss->rs,
+		     _hoss_oid_to_key(oid),
+		     ((rs_id_t *)(iv->data))[0],
+		     buf,
+		     iv->size * iv->reclen,
+		     iv->log_offset);
+	return rc;
+}
+
+static __blocking int
+doprobe(struct idb_interval *query, IDB idb, struct idb_interval *ivs,
+	size_t maxivs, size_t *nivs, struct hoss_grp *grp)
+{
+	int rc;
+	struct iv_agg_inout probed_ivs;
+
+	probed_ivs.maxivs = maxivs;
+	probed_ivs.nivs = 0;
+	probed_ivs.ivs = ivs;
+	probed_ivs.goal = query;
+
+	rc = aeidb_stab(grp->idbx, idb, query, iv_agg, &probed_ivs);
+
+	*nivs = probed_ivs.nivs;
+	return rc;
+}
+
+static __blocking int
+doread(struct hoss_read_ctx *r, idb_off_t *next, struct idb_interval *ivs,
+       size_t nivs, struct hoss_grp *grp)
+{
+	int rc;
+	size_t i;
+
+	rc = 0;
+	for (i = 0; i < nivs; i++) {
+		rc = is_iv_valid(grp, r, ivs + i, *next);
+		if (rc != 0)
+			break;
+
+		*next = ivs[i].rec + ivs[i].size;
+
+		rc = read_region(grp->hoss, r->oid, ivs + i,
+				 ((char *)(r->buf)) + r->byte_count_val);
+		if (rc != 0) {
+			ERR("rs_read failed: %s\n", strerror(errno));
+			break;
+		}
+		r->byte_count_val += ivs[i].size * ivs[i].reclen;
+		if (r->byte_count_val > r->byte_max)
+			abort();
+	}
+
+	return rc;
+}
+
+/* TODO: Coalesce */
+static void
+probe_copy(struct hoss_read_ctx *r, struct idb_interval *ivs, size_t nivs,
+	   hoss_update_t *upinfo)
+{
+	size_t i;
+	struct hoss_record_info *info;
+
+	for (i = 0; i < nivs && r->info_count_val < r->info_max; i++) {
+		info = r->info + r->info_count_val;
+		info->start = ivs[i].rec;
+		info->nrecs = ivs[i].size;
+		info->reclen = ivs[i].reclen;
+		info->update_id = ivs[i].vers;
+		r->info_count_val++;
+		if (*upinfo == HOSS_UPDATE_INVALID || *upinfo == ivs[i].vers)
+			*upinfo = ivs[i].vers;
+		else
+			*upinfo = HOSS_UPDATE_MIXED;
+	}
+	return;
+}
+
+__blocking int
+hoss_exec_read_noalloc(struct hoss_read_ctx *r, struct hoss_grp *grp, char *id,
+		      struct idb_interval *ivs, size_t maxivs)
+{
+	size_t diff;
+	IDB idb;
+	int rc;
+	struct iv_agg_inout inout;
+	struct idb_interval query;
+	size_t nivs;
+	hoss_off_t next;
+	size_t niters, nactions, i;
+
+	niters = 0;
+
+	inout.ivs = ivs;
+	inout.goal = &query;
+
+	rc = hoss_idb_cache_get(&idb, id, 0, grp->hoss->idbc, grp->dbs);
+	if (rc != 0)
+		return rc;
+	do {
+		nivs = 0;
+		r->byte_count_val = 0;
+		r->info_count_val = 0;
+		query.rec = r->start;
+		query.size = r->nrecs;
+		query.vers = 1; /* For check's sake */
+
+		if (!_hoss_is_in_range(&query)) {
+			rc = ERANGE;
+			break;
+		}
+
+		next = query.rec;
+		niters++;
+
+		grp->idbx = _hoss_idbx_get(grp);
+		if (grp->idbx == NULL) {
+			printf("idbx == NULL?!\n");
+			break;
+		}
+
+		do {
+			/* We do the reading here even if this is a
+			 * deferred operation. Lifting the read I/O
+			 * out to after the transaction has been
+			 * completed is pretty problematic, because of
+			 * the possibility for overwrite (requires
+			 * locking or referencing the record store
+			 * extents) and possible use of MSYNC. */
+			nactions = 0;
+			rc = doprobe(&query, idb, ivs, maxivs,
+				     &nivs, grp);
+			if (rc == 0 && (r->flags & HOSS_COND_ALL)) {
+				for (i = 0; i < nivs; i++) {
+					if (ivs[i].vers >= r->update_condition) {
+						rc = HOSS_ECONDFAIL;
+					}
+				}
+			}
+			if (rc == 0 && r->info_count_val < r->info_max) {
+				probe_copy(r, ivs, nivs, &r->update_info_val);
+				nactions++;
+			}
+			if (rc == 0 && r->byte_count_val < r->byte_max) {
+				rc = doread(r, &next, ivs, nivs, grp);
+				nactions++;
+			}
+			if (nivs == 0 || rc || nactions == 0)
+				break;
+
+			diff = ivs[nivs-1].rec + ivs[nivs-1].size - query.rec;
+			query.rec += diff;
+			query.size -= diff;
+		} while(query.size != 0 && rc == 0);
+
+		if (rc == 0)
+			rc = _hoss_idbx_put(grp, COMMIT);
+		else
+			(void)_hoss_idbx_put(grp, 0);
+	} while(rc == IDB_DEADLOCK && !(grp->flags & HOSS_MSYNC));
+	if (rc != 0) {
+		grp->status |= _HOSS_RDERROR;
+	}
+	return rc;
+}
+
+static __blocking int
+read_exec(struct hoss_op *op)
+{
+	struct hoss_read_ctx *r;
+	struct idb_interval *ivs;
+	char *id;
+	struct hoss_grp *grp;
+	size_t maxivs;
+
+	maxivs = 8;
+
+	grp = op->parent;
+
+	r = (struct hoss_read_ctx *)op->vargs;
+
+	ivs = malloc(sizeof(*ivs) * maxivs);
+	if (ivs == NULL) {
+		grp->status |= _HOSS_RDERROR;
+		return errno;
+	}
+
+	*(r->rc) = _hoss_alloc_oid_to_ch(r->oid, &id);
+	if (*(r->rc)) {
+		free(ivs);
+		grp->status |= _HOSS_RDERROR;
+		return *(r->rc);
+	}
+
+	*(r->rc) = hoss_exec_read_noalloc(r, grp, id, ivs, maxivs);
+
+	free(ivs);
+	free(id);
+	if (*(r->rc))
+		grp->status |= _HOSS_RDERROR;
+	if (r->info_count_dst != NULL)
+		*(r->info_count_dst) = r->info_count_val;
+	if (r->byte_count_dst != NULL)
+		*(r->byte_count_dst) = r->byte_count_val;
+	if (r->update_info_dst != NULL)
+		*(r->update_info_dst) = r->update_info_val;
+
+	return *(r->rc);
+}
+
+static __blocking int
+read_cleanup(struct hoss_op *op)
+{
+	free(op);
+	return 0;
+}
+
+static __blocking int
+op_noop(struct hoss_op *op)
+{
+	return 0;
+}
+
+__blocking int
+hoss_read(struct hoss_oid *oid,
+	 hoss_off_t start,
+	 hoss_size_t nrecs,
+	 hoss_flags_t flags,
+	 hoss_update_t update_condition,
+	 void *buf,
+	 hoss_size_t byte_max,
+	 struct hoss_record_info *info,
+	 hoss_size_t info_max,
+	 struct hoss_grp *grp,
+	 hoss_size_t *byte_count,
+	 hoss_size_t *info_count,
+	 hoss_update_t *update_info,
+	 int *rc)
+{
+	struct hoss_read_ctx r;
+	struct hoss_op *op;
+	int _rc;
+
+	r.oid = oid;
+	r.start = start;
+	r.nrecs = nrecs;
+	r.flags = flags;
+	r.update_condition = update_condition;
+	r.buf = buf;
+	r.byte_max = byte_max;
+	r.info = info;
+	r.info_max = info_max;
+	r.byte_count_dst = byte_count;
+	r.info_count_dst = info_count;
+	r.update_info_dst = update_info;
+	r.update_info_val = HOSS_UPDATE_INVALID;
+	r.rc = rc;
+
+	op = malloc(sizeof(*op) + sizeof(r));
+	if (op == NULL) {
+		return ENOMEM;
+	}
+
+	memcpy(op->vargs, &r, sizeof(r));
+	op->exec = read_exec;
+	op->prep = op_noop;
+	op->finish = op_noop;
+	op->rollback = op_noop;
+	op->cleanup = read_cleanup;
+	op->parent = grp;
+
+	_rc = op->prep(op);
+	if (_rc != 0) {
+		(void)op->cleanup(op);
+	} else {
+		if (grp->flags & HOSS_DEFERRED) {
+			*rc = EINPROGRESS;
+			TAILQ_INSERT_TAIL(&grp->deferred_ops, op, ops);
+		} else {
+			(void)op->exec(op);
+			(void)op->cleanup(op);
+		}
+	}
+	return _rc;
+}

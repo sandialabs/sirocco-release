@@ -1,0 +1,52 @@
+#include <aesop/aesop.h>
+
+#include <hoss.hae>
+#include <stdlib.h>
+#include <sys/time.h>
+
+#include "test_util.hae"
+
+__blocking int
+get_empty_oid(struct hoss_oid **_oid, struct hoss_grp *g,
+	      struct hoss_ctx *ctx)
+{
+	struct timeval tv;
+	int rc, drc;
+	struct hoss_record_info ri;
+	hoss_size_t nris;
+	struct hoss_oid *oid;
+
+
+	*_oid = oid = malloc(sizeof(*oid)+sizeof(hoss_eid_t));
+	assert(oid != NULL);
+
+	do {
+		rc = gettimeofday(&tv, NULL);
+		assert(rc == 0);
+
+		oid->nids = 1;
+		oid->ids = (void *)(oid + 1);
+		oid->ids[0] = tv.tv_usec + (((uint64_t)tv.tv_sec) << 32);
+		printf("Trying OID %lu\n", oid->ids[0]);
+
+		rc = hoss_read(
+			oid,         /* struct hoss_oid *oid, */
+			0,            /* hoss_off_t start, */
+			HOSS_OFF_MAX,  /* hoss_size_t nrecs, */
+			0,            /* hoss_flags_t flags, */
+			0,            /* hoss_update_t update_condition, */
+			NULL,         /* void *buf, */
+			0,            /* hoss_size_t bufsize, */
+			&ri,          /* struct hoss_record_info *ribuf, */
+			1,            /* hoss_size_t maxris, */
+			g,            /* struct hoss_grp *grp, */
+			NULL,         /* hoss_size_t *nbytes_read, */
+			&nris,        /* hoss_size_t *nris, */
+			NULL,         /* hoss_update_t *update_info, */
+			&drc          /* int *rc */);
+	} while (rc == 0 && drc == 0 && nris != 0);
+	printf("Using OID %lu\n", oid->ids[0]);
+	assert(rc == 0 && drc == 0 && nris == 0);
+
+	return 0;
+}

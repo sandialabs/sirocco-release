@@ -1,0 +1,43 @@
+
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#ifndef __RECORDSTORE_METHOD_HAE__
+#define __RECORDSTORE_METHOD_HAE__
+
+#include <aesop/aesop.h>
+
+#include <recordstore.hae>
+
+/* NOTE: the method is allowed to provide a void* pointer at init() time
+ * that the upper layer will pass back in to all other calls to this
+ * instance.  This gives the method a place to store instance-specific data,
+ * and in particular to support the case where the same method is
+ * initialized multiple times to point at different storage devices.
+ */
+struct recordstore_method
+{
+    const char* name;
+    void* (*init)(const char* params);
+    __blocking int (*write)(void* method_data, rs_key_t key, 
+        const void* buffer, size_t nbytes, rs_id_t* out_id);
+    __blocking int (*read)(void* method_data, rs_key_t key, 
+        rs_id_t id, void* buffer, size_t nbytes, off_t relative_offset);
+    __blocking int (*deprecate)(void* method_data, rs_key_t key, rs_id_t id);
+    __blocking int (*flush)(void* method_data, rs_key_t key, rs_id_t id);
+    void (*diag)(void* method_data);
+    void (*finalize)(void* method_data);
+};
+
+#endif /* __RECORDSTORE_METHOD_HAE__ */
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

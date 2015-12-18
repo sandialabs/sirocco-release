@@ -1,0 +1,11 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: idb
+Description: A C-language implementation of an interval database.
+Version: 0.2
+Requires:
+Libs: -L${libdir} -lidb -ldb
+Cflags: -I${includedir}

@@ -1,0 +1,41 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#ifndef __ALIGNMENT_HAE__
+#define __ALIGNMENT_HAE__
+
+#include <stdint.h>
+#include <aesop/aesop.h>
+
+/* align_write(): analogous to pwrite, except for two differences:
+ * - automatically aligns writes to alignment, using intermediate memory
+ *   buffers if necessary
+ * - does not do short writes (either writes entire buffer or fails)
+ *
+ * returns 0 on success, -error on failure
+ */
+__blocking int align_write(int fd, const void *buf, size_t count, off_t offset, int alignment);
+
+/* align_read(): analogous to pread, except for two differences:
+ * - automatically aligns reads to alignment, using intermediate memory
+ *   buffers if necessary
+ * - does not do short reads (either reads entire buffer or fails)
+ *
+ * returns 0 on success, -error on failure
+ */
+__blocking int align_read(int fd, void *buf, size_t count, off_t offset, int alignment);
+
+
+#endif
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

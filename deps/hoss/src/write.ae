@@ -1,0 +1,270 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <errno.h>
+#include <aeidb.hae>
+#include "idb_cache.h"
+#include "internal.hae"
+#include <recordstore.hae>
+
+struct hoss_write_args {
+	struct hoss_oid *oid;
+	struct idb_interval iv;
+	hoss_flags_t flags;
+	hoss_update_t update_condition;
+	hoss_update_t new_update;
+	const void *writebuf;
+	hoss_size_t *nbytes_written;
+	int *rc;
+};
+
+__blocking int
+write_prep(struct hoss_op *op)
+{
+	int rc;
+	struct hoss_write_args *wa;
+	rs_key_t key;
+
+	wa = (struct hoss_write_args *)(op->vargs);
+	key = _hoss_oid_to_key(wa->oid);
+
+	rc = rs_write(op->parent->hoss->rs,
+		      key,
+		      wa->writebuf,
+		      wa->iv.size * wa->iv.reclen,
+		      (rs_id_t *)(&wa->iv.data));
+	return rc;
+}
+
+static __blocking int
+max_update_id(const struct idb_interval *iv, void *varg)
+{
+	hoss_update_t *ucp;
+
+	ucp = varg;
+	if (*ucp < iv->vers)
+		*ucp = iv->vers;
+	return 1;
+}
+
+static __blocking int
+exec_conditionals(IDBX idbx, IDB idb, struct hoss_write_args *wa)
+{
+	hoss_update_t max;
+	int rc;
+
+	/* Common operation required */
+	if ((wa->flags & (HOSS_COND_ALL | HOSS_AUTO_INC)) != 0) {
+		max = 0;
+		rc = aeidb_stab(idbx, idb, &wa->iv, max_update_id, &max);
+		if (rc) {
+			return rc;
+		}
+	}
+
+	/* Individual condition evaluations */
+	if (wa->flags & HOSS_COND_ALL) {
+		if (wa->update_condition <= max) {
+#ifdef DEBUG_INFO
+			INFO("failing on condition\n");
+#endif
+			return HOSS_ECONDFAIL;
+		}
+	}
+	if (wa->flags & HOSS_AUTO_INC) {
+#ifdef DEBUG_INFO
+		INFO("auto_inc: max = %lu, new_update = %lu, set vers to "
+		     "%lu\n", max, wa->new_update, max + wa->new_update);
+#endif
+		wa->iv.vers = max + wa->new_update;
+		/* Overflow */
+		if (wa->iv.vers < max || wa->iv.vers > HOSS_UPDATE_MAX) {
+			return HOSS_ECONDFAIL;
+		}
+	}
+	return 0;
+}
+
+__blocking int
+write_exec(struct hoss_op *op)
+{
+	int rc, vrc;
+	char *id;
+	struct idb_interval iv;
+	IDB idb;
+	IDBX idbx;
+	struct hoss_write_args *wa;
+	hoss_update_t max;
+
+	wa = (struct hoss_write_args *)(op->vargs);
+
+	*(wa->nbytes_written) = 0;
+	if ((op->parent->flags & HOSS_SHORT) &&
+	    (op->parent->status & _HOSS_WRERROR) &&
+	    (op->parent->status & _HOSS_RDERROR) == 0) {
+		*(wa->rc) = 0;
+		return 0;
+	}
+
+	rc = _hoss_alloc_oid_to_ch(wa->oid, &id);
+	if (rc) {
+		op->parent->status |= _HOSS_WRERROR;
+		*(wa->rc) = rc;
+		return rc;
+	}
+
+	rc = hoss_idb_cache_get(&idb, id, 0, op->parent->hoss->idbc,
+			       op->parent->dbs);
+	while (1) {
+		rc = 0;
+		idbx = _hoss_idbx_get(op->parent);
+		if (idbx == NULL) {
+			rc = errno;
+			break;
+		}
+
+		rc = exec_conditionals(idbx, idb, wa);
+		if (rc == 0)
+			rc = aeidb_insert(idbx, idb, &wa->iv);
+
+		/* Range checks */
+		if (rc == 0 && !(_hoss_is_in_range(&wa->iv))) {
+			rc = ERANGE;
+		}
+
+		if (rc != 0) {
+			(void)_hoss_idbx_put(op->parent, 0);
+		} else {
+			rc = _hoss_idbx_put(op->parent, COMMIT);
+		}
+
+		/* Retry on deadlock */
+		if (rc == IDB_DEADLOCK && !(op->parent->flags & HOSS_MSYNC))
+			continue;
+
+		/* Exit on error */
+		if (rc != 0)
+			break;
+
+		/* Exit successfully */
+		*(wa->nbytes_written) += wa->iv.size * wa->iv.reclen;
+		break;
+	}
+	if (rc != 0) {
+		op->parent->status |= _HOSS_WRERROR;
+	}
+
+	free(id);
+	*(wa->rc) = rc;
+	return rc;
+}
+
+static __blocking int
+write_finish(struct hoss_op *op)
+{
+	return 0;
+}
+
+__blocking int
+write_rollback(struct hoss_op *op)
+{
+	/* TODO: Punch */
+	return 0;
+}
+
+__blocking int
+write_cleanup(struct hoss_op *op)
+{
+	free(op);
+	return 0;
+}
+
+__blocking int
+write_create(struct hoss_oid *oid,
+	     hoss_off_t start,
+	     hoss_size_t nrecs,
+	     hoss_size_t reclen,
+	     hoss_flags_t flags,
+	     hoss_update_t update_condition,
+	     hoss_update_t new_update,
+	     const void *writebuf,
+	     hoss_size_t *nbytes_written,
+	     struct hoss_grp *grp,
+	     int *rc,
+	     struct hoss_op **_op)
+{
+	struct hoss_write_args *wa;
+	struct hoss_op *op;
+
+	op = *_op = malloc(sizeof(*op) + sizeof(*wa));
+	if (op == NULL)
+		return ENOMEM;
+	wa = (struct hoss_write_args *)(op->vargs);
+
+	wa->oid = oid;
+	wa->iv.rec = start;
+	wa->iv.size = nrecs;
+	wa->iv.reclen = reclen;
+	wa->flags = flags;
+	wa->update_condition = update_condition;
+	wa->iv.vers = new_update;
+	wa->new_update = new_update;
+	wa->writebuf = writebuf;
+	wa->nbytes_written = nbytes_written;
+	wa->rc = rc;
+
+	wa->iv.log_offset = 0;
+	wa->iv.epoch = 0;
+	wa->iv.flags = 0;
+
+	op->prep = write_prep;
+	op->prepped = 0;
+	op->exec = write_exec;
+	op->execed = 0;
+	op->finish = write_finish;
+	op->rollback = write_rollback;
+	op->cleanup = write_cleanup;
+
+	op->parent = grp;
+
+	return 0;
+}
+
+__blocking int
+hoss_write(struct hoss_oid *oid,
+          hoss_off_t start,
+          hoss_size_t nrecs,
+          hoss_size_t reclen,
+          hoss_flags_t flags,
+          hoss_update_t update_condition,
+          hoss_update_t new_update,
+          const void *writebuf,
+          struct hoss_grp *grp,
+          hoss_size_t *nbytes_written,
+	  int *_rc)
+{
+	struct hoss_op *op;
+	int rc;
+
+	rc = write_create(oid, start, nrecs, reclen, flags, update_condition,
+			  new_update, writebuf, nbytes_written, grp, _rc,
+			  &op);
+	if (rc != 0)
+		return rc;
+
+	rc = op->prep(op);
+	if (rc != 0) {
+		op->cleanup(op);
+		return rc;
+	}
+
+	if (grp->flags & HOSS_DEFERRED) {
+		*_rc = EINPROGRESS;
+		TAILQ_INSERT_TAIL(&grp->deferred_ops, op, ops);
+	} else {
+		(void)op->exec(op);
+		(void)op->cleanup(op);
+	}
+
+	return rc;
+}

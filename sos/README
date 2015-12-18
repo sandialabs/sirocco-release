@@ -1,0 +1,25 @@
+libsos: Sirocco ASG middleware
+Sandia National Laboratories
+File Author: Geoff Danielson, gcdanie@sandia.gov
+File Maintainer: Geoff Danielson, gcdanie@sandia.gov
+
+Installation notes
+
+This will build a library (libsos.a) to which one can link to, providing the functionality behind the ASG API (asg.h).  At present, it is limited to batches of read and write calls (including the probe functionality in read).
+
+To demonstrate this functionality, refer to the two included test drivers:
+testit.c
+* Builds a batch consisting of a write and read call, followed by a synchronous submission, repeated until the number of megabytes (MiB) specified in the arguments have been written and read.
+* Writes and reads in order (records of size 1 are written in batches of the specified buffer size, in canonical order).
+* Does not verify integrity of the reads after writing.
+* Returns the bytes written and read along with a time (seconds and nanoseconds)
+
+randtest.c 
+* Builds a batches consisting of a write call, submitted synchronously, until the number of megabytes (MiB) specified in the arguments have been written, followed by batches consisting of a read/probe call, submitted synchronously, until the number of megabytes (MiB) specified in the arguments have been read.
+* Uses records of the buffer size specified in the arguments, writing one record at a time.
+* Writes in a random order, and reads/probes in a different random order
+* Verifies the integrity of the reads and probes after writing.
+
+Building with libsos.a
+
+libsos relies on SXM, SSMPTCP, SSM, pthreads, and rt.  Please include those in your Makefile.

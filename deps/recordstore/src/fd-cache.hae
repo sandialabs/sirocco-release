@@ -1,0 +1,99 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#ifndef __FD_CACHE_HAE__
+#define __FD_CACHE_HAE__
+
+/** \defgroup FD cache
+ *
+ * This is a simple API for caching open file descriptors and tracking most
+ * recent log positions in memory.
+ * 
+ * .
+ * @{
+ */
+
+/** \file
+ * Declarations for FD cache API.
+ */
+
+#include <stdint.h>
+#include <triton-list.h>
+#include <aesop/aesop.h>
+
+#include <recordstore.hae>
+
+/* an instantiation of an fd cache (more than one may be active
+ * simultaneously)
+ */
+struct rs_fd_cache_instance;
+
+struct rs_fd_cache_entry
+{
+    rs_key_t key;  /* log to write to; assume this has already been prefix filtered */
+    int fd;              /* file descriptor */
+    int64_t log_offset;  /* next available log offset */
+    pthread_mutex_t log_offset_mutex;  /* protects log_offset field */
+    int ref_count;       /* number of people using this fd */
+    triton_list_link_t unused_link;  /* link to unused list */
+    triton_list_link_t hash_link;    /* link to hash table */
+    struct rs_fd_cache_instance* fdci;
+};
+
+/**
+ * Initializes fd cache interface
+ */
+struct rs_fd_cache_instance* rs_fd_cache_initialize(
+    char* path,  /**< path on disk to data files */
+    int alignment, /**< I/O alignment */
+    int flags, /**< flags to modify open() behavior */
+    int sync_highwater /**< sync coalescing highwater mark */
+);
+
+void rs_fd_cache_finalize(struct rs_fd_cache_instance* fdci);
+
+/**
+ * Gets a reference to an object
+ * \return 0 on success, -errno on failure
+ */
+__blocking int rs_fd_cache_get(
+    struct rs_fd_cache_instance* fdci,
+    struct rs_fd_cache_entry** entry,
+    rs_key_t key /**< log ID */
+);
+
+/**
+ * Returns a reference to an object
+ */
+void rs_fd_cache_put(
+    struct rs_fd_cache_entry* entry /**< entry to put */
+);
+
+/**
+ * Removes an object
+ */
+__blocking void rs_fd_cache_remove(
+    struct rs_fd_cache_instance* fdci,
+    rs_key_t key /**< log ID */
+);
+
+/**
+ * Closes any file descriptors that aren't in active use
+ */
+__blocking void rs_fd_cache_purge(struct rs_fd_cache_instance* fdci);
+
+#endif
+
+/* @} */
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

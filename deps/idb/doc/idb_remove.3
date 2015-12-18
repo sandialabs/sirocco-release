@@ -1,0 +1,71 @@
+.\" Process this file with groff -man -Tascii foo.1
+.\"
+.TH IDB_INSERT 3 "APRIL 2014" "Linux/OS X" "API Documentation"
+.SH NAME
+idb_remove \- Remove an interval into an IDB
+.SH LIBRARY
+The Interval Database Library (libidb, -lidb or -laeidb)
+.SH SYNOPSIS
+.nf
+.B #include <idb.h>
+
+.BI "int"
+.BI "idb_remove(IDBX " idbx ", IDB " idb ", struct idb_interval " *iv ");"
+
+.B #include <aeidb.hae>
+
+.BI "__blocking int"
+.BI "aeidb_remove(IDBX " idbx ", IDB "idb ", struct idb_interval " *iv ");"
+.fi
+.SH DESCRIPTION
+The
+.BR idb_remove ()
+function removes
+.I iv
+from
+.I idb
+as part of
+.I idbx.
+Upon successful completion, the range covered by
+.I iv
+will be an empty contiguous region within the context of
+.I idbx,
+with overlapping intervals truncated.
+.BR aeidb_remove
+is an Aesop variant that may call blocking functions internally,
+causing execution to move to another pbranch when available.
+.SH RETURN VALUES
+.I idb_remove
+returns 0 on success, or an error code from
+.B <errno.h>.
+BerkeleyDB reserves the right to return practically any error code it
+wishes, so IDB functions will as well. The most likely/well-defined
+error codes are:
+.TP
+.B EDOM
+The interval's range falls outside of values expressable with
+.I idb_off_t
+.TP
+.B EPERM
+.I idb
+is read-only.
+.TP
+.B ENOTRECOVERABLE
+The Berkeley DB state has become corrupt. To fix, IDB must be shut
+down and restarted.
+.TP
+.B ENOMEM
+There was insufficient memory available to complete the request.
+.TP
+.B ENOSPC
+The Berkeley DB btree structure for
+.I idb
+has reached maximum depth.
+
+No storage space available.
+.SH BUGS
+.\".IP \(bu 3
+Parallel updates to a single IDB are problematic for several
+reasons. It is best to serialize writes to a given IDB, including not
+opening a new transaction until the old one is finished. Concurrent
+reads, and reads in parallel with a single write, are OK.

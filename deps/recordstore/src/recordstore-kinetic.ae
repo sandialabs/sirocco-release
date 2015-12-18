@@ -1,0 +1,407 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#include <stdio.h>
+#include <pthread.h>
+
+#include <aesop/aesop.h>
+#include <recordstore.hae>
+#include "recordstore-method.hae"
+#include <aesop/aekinetic.hae>
+
+static void* kinetic_init (const char* params);
+static __blocking int kinetic_write(void* method_data, rs_key_t key,
+  const void* buffer, size_t nbytes, rs_id_t* out_id);
+static __blocking int kinetic_read(void* method_data, rs_key_t key, 
+    rs_id_t id, void* buffer, size_t nbytes, off_t relative_offset);
+static __blocking int kinetic_deprecate(void* method_data, rs_key_t key, 
+    rs_id_t id);
+static __blocking int kinetic_flush(void* method_data, rs_key_t key, rs_id_t id);
+static void kinetic_diag(void* method_data);
+static void kinetic_finalize(void* method_data);
+
+struct recordstore_method rs_kinetic_method = 
+{
+    .name      = "kinetic",
+    .init      = kinetic_init,
+    .write     = kinetic_write,
+    .read      = kinetic_read,
+    .deprecate = kinetic_deprecate,
+    .flush     = kinetic_flush,
+    .diag      = kinetic_diag,
+    .finalize  = kinetic_finalize,
+};
+
+struct kinetic_data
+{
+    void *instance;
+    char *params;
+};
+
+static void* kinetic_init(const char* params)
+{
+    struct kinetic_data *method_data;
+    char *host;
+    int   port;
+    int   ssl;
+    int   uid;
+    char *key;
+    int   result;
+    int   ver;
+    int   nthr;
+    void *instance_data;
+    char *save;
+    char *token;
+
+    /* defaults */
+    host = "localhost";
+    port = 9000;
+    ssl  = 0;
+    uid  = 1;
+    key  = "deadbeef";
+    ver  = 1;
+    nthr = 1;
+    save = 0;
+
+    method_data = malloc(sizeof(*method_data));
+    assert(method_data);
+
+    method_data->params = strdup(params);
+
+    printf("params: %s\n", params);
+
+    /* parse values */
+    for (token = strtok_r(params, ",", &save);
+         token != NULL;
+         token = strtok_r(NULL, ",", &save))
+    {
+        char *parm;
+        char *val;
+
+        parm = token;
+        val  = strchr(parm, ':');
+        *val = 0;
+        val++;
+
+        if (!strcmp(parm, "host"))
+        {
+            host = val;
+        }
+        else if (!strcmp(parm, "port"))
+        {
+            port = atoi(val);
+        }
+        else if (!strcmp(parm, "ssl"))
+        {
+            ssl = ((!strcmp(val, "true")) ? 1 : 0);
+        }
+        else if (!strcmp(parm, "uid"))
+        {
+            uid = atoi(val);
+        }
+        else if (!strcmp(parm, "hmac"))
+        {
+            key = val;
+        }
+        else if (!strcmp(parm, "version"))
+        {
+            ver = atoi(val);
+        }
+        else if (!strcmp(parm, "nthread"))
+        {
+            nthr = atoi(val);
+        }
+        else
+        {
+            fprintf(stderr, "unknown parameter: %s:%s\n", parm, val);
+        }
+    }
+
+    result = aekinetic_init(&method_data->instance,
+                            nthr,
+                            key,
+                            host,
+                            port,
+                            ver,
+                            uid);
+    assert(!result);
+
+    return method_data;
+}
+
+static void kinetic_finalize(void* method_data)
+{
+     struct kinetic_data *data = (struct kinetic_data *) method_data;
+
+     aekinetic_finalize(&data->instance);
+     free(data);
+
+     return;
+}
+
+static __blocking int kinetic_write (void*       method_data,
+                                     rs_key_t    key,
+                                     const void* buffer,
+                                     size_t      nbytes,
+                                     rs_id_t*    out_id)
+{
+    int result;
+
+    memset(out_id, 0, sizeof(*out_id));
+
+    assert(nbytes < (1024*1024));
+
+    result = aekinetic_put(((struct kinetic_data*)method_data)->instance,
+                           &key,
+                           sizeof(key),
+                           buffer,
+                           nbytes,
+                           0,
+                           KINETIC_SYNCHRONIZATION_WRITEBACK);
+
+    return result;
+}
+
+static __blocking int kinetic_read(void* method_data,
+                                   rs_key_t key, 
+                                   rs_id_t id,
+                                   void* buffer,
+                                   size_t nbytes,
+                                   off_t relative_offset)
+{
+    int result;
+    int64_t version;
+    uint64_t key_len;
+    uint64_t buf_len;
+    char *tmp;
+
+    assert(nbytes < (1024*1024));
+    assert((nbytes+relative_offset) < (1024*1024));
+
+    tmp = malloc(1024*1024);
+    assert(tmp);
+
+    key_len = sizeof(key);
+    buf_len = 1024*1024;
+
+    result = aekinetic_get(((struct kinetic_data*)method_data)->instance,
+                           &key,
+                           &key_len,
+                           tmp,
+                           &buf_len,
+                           &version);
+
+    if (result == 0)
+    {
+        //assert(version == 1);
+        assert(key_len == sizeof(key));
+        //assert(buf_len == nbytes);
+        memcpy(buffer, tmp+relative_offset, nbytes);
+    }
+
+    free(tmp);
+
+    return result;
+}
+
+static __blocking int kinetic_deprecate(void* method_data,
+                                        rs_key_t key,
+                                        rs_id_t id)
+{
+    int rc;
+
+    rc = aekinetic_delete(((struct kinetic_data*)method_data)->instance,
+                          &key,
+                          sizeof(key),
+                          0,
+                          KINETIC_SYNCHRONIZATION_WRITEBACK); 
+    return rc;
+}
+
+static __blocking int kinetic_flush(void* method_data,
+                                    rs_key_t key,
+                                    rs_id_t id)
+{
+    /* flushes all previous puts and deletes */
+    return aekinetic_flush(((struct kinetic_data*)method_data)->instance);
+}
+
+static void kinetic_diag(void* method_data)
+{
+    struct kinetic_data *data = (struct kinetic_data*) method_data;
+    KineticDeviceInfo *info;
+    KineticStatus rc;
+
+    printf("Diags for recordstore: kinetic\n");
+    printf("internal data: %p\n", method_data);
+    printf("params: %s\n", data->params); 
+
+    rc = aekinetic_getlog_nb (((struct kinetic_data*)method_data)->instance,
+                              KINETIC_DEVICE_INFO_TYPE_DEVICE,
+                              &info);
+    if ((rc == 0) && (info))
+    {
+        if (info->device)
+        {
+            printf("device: %s\n", info->device->name.data);
+        }
+        free(info);
+    }
+
+    rc = aekinetic_getlog_nb(((struct kinetic_data*)method_data)->instance,
+                             KINETIC_DEVICE_INFO_TYPE_LIMITS,
+                             &info);
+    if ((rc == 0) && (info))
+    {
+        if (info->limits)
+        {
+            printf("limits:\n"
+                   "\tmaxKeySize: %u\n"
+                   "\tmaxValueSize: %u\n"
+                   "\tmaxVersionSize: %u\n"
+                   "\tmaxTagSize: %u\n"
+                   "\tmaxConnections: %u\n"
+                   "\tmaxOutstandingReadRequests: %u\n"
+                   "\tmaxOutstandingWriteRequests: %u\n"
+                   "\tmaxMessageSize: %u\n"
+                   "\tmaxKeyRangeCount: %u\n"
+                   "\tmaxIdentityCount: %u\n"
+                   "\tmaxPinSize: %u\n",
+                   info->limits->maxPinSize,
+                   info->limits->maxValueSize,
+                   info->limits->maxVersionSize,
+                   info->limits->maxTagSize,
+                   info->limits->maxConnections,
+                   info->limits->maxOutstandingReadRequests,
+                   info->limits->maxOutstandingWriteRequests,
+                   info->limits->maxMessageSize,
+                   info->limits->maxKeyRangeCount,
+                   info->limits->maxIdentityCount,
+                   info->limits->maxPinSize);
+        }
+        free(info);
+    }
+
+    rc = aekinetic_getlog_nb(((struct kinetic_data*)method_data)->instance,
+                             KINETIC_DEVICE_INFO_TYPE_CONFIGURATION,
+                             &info);
+    if ((rc == 0) && (info))
+    {
+        if (info->configuration)
+        {
+            int i;
+
+            printf("configuration:\n"
+                   "\tvendor: %s\n"
+                   "\tmodel: %s\n"
+                   "\tserialNumber: %s\n"
+                   "\tworldWideName: %s\n"
+                   "\tversion: %s\n"
+                   "\tcompilationDate: %s\n"
+                   "\tsourceHash: %s\n"
+                   "\tprotocolVersion: %s\n"
+                   "\tprotocolCompilationDate: %s\n"
+                   "\tprotocolSourceHash: %s\n"
+                   "\tport: %d\n"
+                   "\ttlsPort: %d\n",
+                   info->configuration->vendor,
+                   info->configuration->model,
+                   info->configuration->serialNumber.data,
+                   info->configuration->worldWideName.data,
+                   info->configuration->version,
+                   info->configuration->compilationDate,
+                   info->configuration->sourceHash,
+                   info->configuration->protocolVersion,
+                   info->configuration->protocolCompilationDate,
+                   info->configuration->protocolSourceHash,
+                   info->configuration->port,
+                   info->configuration->tlsPort);
+            printf("\tinterfaces: %ld\n", info->configuration->numInterfaces);
+            for (i = 0; i < info->configuration->numInterfaces; i++)
+            {
+                printf("\t%s: ipv4:%s ipv6:%s mac:%s\n",
+                       info->configuration->interfaces[i].name,
+                       info->configuration->interfaces[i].ipv4Address.data,
+                       info->configuration->interfaces[i].ipv6Address.data,
+                       info->configuration->interfaces[i].MAC.data);
+            }
+        }
+        free(info);
+    }
+
+    rc = aekinetic_getlog_nb(((struct kinetic_data*)method_data)->instance,
+                             KINETIC_DEVICE_INFO_TYPE_CAPACITIES,
+                             &info);
+    if ((rc == 0) && (info))
+    {
+        if (info->capacity)
+        {
+            printf("capcity:\n"
+                   "\tnominalCapacityInBytes: %lu\n"
+                   "\tportionFull: %f\n",
+                   info->capacity->nominalCapacityInBytes,
+                   info->capacity->portionFull);
+        }
+        free(info);
+    }
+
+    rc = aekinetic_getlog_nb(((struct kinetic_data*)method_data)->instance,
+                             KINETIC_DEVICE_INFO_TYPE_STATISTICS,
+                             &info);
+    if ((rc == 0) && (info))
+    {
+        if (info->statistics)
+        {
+            int i;
+            printf("statistics: %ld\n", info->numStatistics);
+            for (i = 0; i < info->numStatistics; i++)
+            {
+                if (info->statistics[i].count > 0)
+                    printf("\ttype:%d count:%lu bytes:%lu\n",
+                           info->statistics[i].messageType,
+                           info->statistics[i].count,
+                           info->statistics[i].bytes);
+            }
+        }
+        free(info);
+    }
+
+
+    rc = aekinetic_getlog_nb(((struct kinetic_data*)method_data)->instance,
+                             KINETIC_DEVICE_INFO_TYPE_TEMPERATURES,
+                             &info);
+    if ((rc == 0) && (info))
+    {
+        if (info->temperatures)
+        {
+            int i;
+            printf("temperatures: %ld\n", info->numTemperatures);
+            for (i = 0; i < info->numTemperatures; i++)
+            {
+                printf("\t%s current:%f min:%f max:%f target:%f\n",
+                       info->temperatures[i].name,
+                       info->temperatures[i].current,
+                       info->temperatures[i].minimum,
+                       info->temperatures[i].maximum,
+                       info->temperatures[i].target);
+            }
+        }
+        free(info);
+    }
+
+    /*
+     * generally not useful output right now.
+    rc = aekinetic_getlog_nb(((struct kinetic_data*)method_data)->instance,
+                             KINETIC_DEVICE_INFO_TYPE_MESSAGES,
+                             &info);
+    if ((rc == 0) && (info))
+    {
+        printf("messages:\n\t%s\n", info->messages.data);
+        free(info);
+    }
+    */
+    return;
+}

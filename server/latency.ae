@@ -1,0 +1,118 @@
+#include <aesop/aesop.h>
+#include <aesop/sem.hae>
+#include <aesop/timer.hae>
+
+struct wait_svc {
+	aesop_sem_t sem[2];
+	size_t nwakes;
+	int do_exit;
+};
+
+__blocking int
+sleep(struct wait_svc *svc, size_t id)
+{
+
+	//fprintf(stderr, "DOWN %lu\n", id);
+	pwait {
+		pbranch {
+			int rc;
+			rc = aesop_timer(1000);
+			if (rc == -ECANCELED) {
+				//if (rc != AE_SUCCESS) {
+				fprintf(stderr, "I didn't wake up!\n");
+					aesop_sem_up(svc->sem + id);
+			}
+		}
+		pbranch {
+			int rc;
+			rc = aesop_sem_down(svc->sem + id);
+			//fprintf(stderr, "%lu Canceling\n", id);
+			aesop_cancel_branches();
+		}
+	}
+	return 0;
+}
+
+int
+wake(struct wait_svc *svc, size_t id)
+{
+	int rc;
+
+	id ^= 1;
+	//fprintf(stderr, "UP %lu\n", id);
+	rc = aesop_sem_up(svc->sem + id);
+	return rc;
+}
+
+void
+init(struct wait_svc *svc)
+{
+	aesop_sem_module_init();
+	(void)aesop_sem_init(svc->sem, 0);
+	(void)aesop_sem_init(svc->sem + 1, 0);
+	svc->nwakes = 0;
+	svc->do_exit = 0;
+}
+
+size_t oplimit = 10000000;
+
+__blocking int
+do_wait(struct wait_svc *svc)
+{
+	pwait {
+		pbranch {
+			size_t i;
+			fprintf(stderr, "Starting poll on a\n");
+			while(1) {
+				//fprintf(stderr, "a\n");
+				svc->nwakes++;
+				wake(svc, 0);
+				if (svc->do_exit || svc->nwakes > oplimit)
+					break;
+				sleep(svc, 0);
+			}
+			fprintf(stderr, "1 broke out\n");
+		}
+		pbranch {
+			fprintf(stderr, "Starting poll on b\n");
+			while(1) {
+				//fprintf(stderr, "b\n");
+				svc->nwakes++;
+				sleep(svc, 1);
+				wake(svc, 1);
+				if (svc->do_exit || svc->nwakes > oplimit)
+					break;
+			}
+			fprintf(stderr, "2 broke out\n");
+		}
+	}
+
+	return 0;
+}
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	struct wait_svc svc;
+
+	aesop_timer_init();
+	init(&svc);
+
+	pwait {
+		pbranch {
+			fprintf(stderr, "timer started\n");
+			aesop_timer(1000);
+			fprintf(stderr, "timer went off\n");
+			svc.do_exit = 1;
+		}
+		pbranch {
+			do_wait(&svc);
+		}
+	}
+	printf("Performed %lu ops\n", svc.nwakes);
+	aesop_timer_finalize();
+
+	return 0;
+}
+
+aesop_main_set(aemain);

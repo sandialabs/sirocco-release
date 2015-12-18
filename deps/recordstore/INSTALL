@@ -1,0 +1,27 @@
+Example configure, build, and install commands:
+
+    ./prepare.sh
+
+    mkdir build
+
+    cd build
+
+    ../configure --prefix=/home/pcarns/working/asg/recordstore/install \
+    PKG_CONFIG_PATH=/home/pcarns/working/aesop/install/lib/pkgconfig:/home/pcarns/working/c-utils/install/lib/pkgconfig
+    \
+    CFLAGS="-g -fno-diagnostics-show-caret -fno-omit-frame-pointer"
+
+    make
+
+    make check
+
+    make install
+
+Explanation of configure options:
+
+- The PKG_CONFIG_PATH must include paths to aesop and c-utils dependencies
+  unless they are already available in the default system locations.
+- "-fno-diagnostics-show-caret" is a workaround to avoid superfluous warning
+  text from newer gcc compilers.
+- "-g -fno-omit-frame-pointer" are debugging options, can be replaced with
+  "-O3" or similar if building for performance testing

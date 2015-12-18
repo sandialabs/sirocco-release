@@ -1,0 +1,161 @@
+#include <aesop/aesop.h>
+
+#include <hoss.hae>
+
+#include "test_util.hae"
+
+__blocking int
+write_autoinc(struct hoss_oid *oid, struct hoss_grp *g, hoss_off_t rec,
+	      hoss_update_t step)
+{
+	int rc, orc, ret;
+	size_t nb;
+
+	ret = 0;
+	orc = 0;
+
+	rc = hoss_write(
+			oid,           /* struct hoss_oid *oid */
+			rec,           /* hoss_off_t start */
+			1,             /* hoss_size_t nrecs */
+			0,             /* hoss_size_t reclen */
+			HOSS_AUTO_INC, /* hoss_flags_t flags */
+			0,             /* hoss_update_t update_condition */
+			step,          /* hoss_update_t new_update */
+			NULL,          /* const void *writebuf */
+			g,             /* struct hoss_grp *grp */
+			&nb,           /* hoss_size_t *nbytes_written */
+			&orc           /* int *rc */
+		   );
+	if (rc != 0 || orc != 0) {
+		ERR("Bad return code: rc = %i, orc = %i\n", rc, orc);
+		return (rc != 0) ? rc : orc;
+	}
+	if (nb != 0) {
+		ERR("Bad length returned for write. Expected zero, got %lu\n",
+		    nb);
+		return -1;
+	}
+	return 0;
+}
+
+__blocking int
+read_autoinc(struct hoss_oid *oid, struct hoss_grp *g, hoss_off_t rec,
+	     hoss_update_t up)
+{
+	int rc, orc, ret;
+	struct hoss_record_info ri;
+	hoss_size_t nb, nris;
+
+	ret = 0;
+	orc = 0;
+
+	rc = hoss_read(
+		       oid,       /* struct hoss_oid *oid */
+		       rec,       /* hoss_off_t start */
+		       1,         /* hoss_size_t nrecs */
+		       0,         /* hoss_flags_t flags */
+		       0,         /* hoss_update_t update_condition */
+		       NULL,      /* void *buf */
+		       0,         /* hoss_size_t bufsize */
+		       &ri,       /* struct hoss_record_info *ribuf */
+		       1,         /* hoss_size_t maxris */
+		       g,         /* struct hoss_grp *grp */
+		       &nb,       /* hoss_size_t *nbytes_read */
+		       &nris,     /* hoss_size_t *nris */
+		       NULL,      /* hoss_update_t *update_info */
+		       &orc       /* int *rc */
+		       );
+	if (rc != 0 || orc != 0) {
+		ERR("Bad return code: rc = %i, orc = %i\n", rc, orc);
+		return (rc != 0) ? rc : orc;
+	}
+	if (nb != 0) {
+		ERR("Bad length returned for write. Expected zero, got %lu\n",
+		    nb);
+		return -1;
+	}
+	if (nris == 0) {
+		ERR("No record found\n");
+		return -1;
+	}
+	if (up != ri.update_id) {
+		ERR("Update ID mismatch: %lu given, %lu received\n", up,
+		    ri.update_id);
+		return -1;
+	}
+	return 0;
+}
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	struct hoss_ctx *hoss;
+	int rc, orc;
+	struct hoss_oid *oid;
+	struct hoss_grp *g;
+	hoss_size_t nb, nris;
+	size_t i;
+	hoss_update_t max_step;
+	struct hoss_record_info ri;
+
+	max_step = 100;
+
+	rc = hoss_init(&hoss, ".");
+	assert(rc == 0);
+
+	rc = hoss_begin(&g, NULL, 0, hoss);
+	assert(rc == 0);
+	rc = get_empty_oid(&oid, g, hoss);
+	assert(rc == 0);
+
+	for (i = 1; i < max_step; i++) {
+		printf("max_step = %lu\n", i);
+		rc = write_autoinc(oid, g, 0, i);
+		if (rc != 0)
+			abort();
+		rc = write_autoinc(oid, g, 0, (i+1)*i/2);
+		if (rc != 0)
+			abort();
+	}
+
+	/* Create a maximal write */
+	rc = write_autoinc(oid, g, 1, HOSS_UPDATE_MAX);
+	if (rc != 0) {
+		ERR("Could not write with maximal update ID\n");
+		abort();
+	}
+	/* Try to wrap it, large */
+	ERR("Begin fire drills, ignore following errors about orc = %i\n",
+	    HOSS_ECONDFAIL);
+	rc = write_autoinc(oid, g, 1, HOSS_UPDATE_MAX);
+	if (rc == 0) {
+		ERR("Invalid write was allowed to complete\n");
+		abort();
+	}
+	if (rc != HOSS_ECONDFAIL) {
+		ERR("Invalid write caused unexpected error %i\n", rc);
+		abort();
+	}
+
+	/* Try to wrap it, small */
+	rc = write_autoinc(oid, g, 1, 1);
+	if (rc == 0) {
+		ERR("Invalid write was allowed to complete\n");
+		abort();
+	}
+	if (rc != HOSS_ECONDFAIL) {
+		ERR("Invalid write caused unexpected error %i\n", rc);
+		abort();
+	}
+	ERR("End fire drills\n");
+
+	rc = hoss_end(g, 1);
+	assert(rc == 0);
+	hoss_fini(hoss);
+	printf("Successful exit\n");
+
+	return 0;
+}
+
+aesop_main_set(aemain);

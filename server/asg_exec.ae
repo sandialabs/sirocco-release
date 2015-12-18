@@ -1,0 +1,996 @@
+#include <aesop/sem.hae>
+#include <aesop/aethread.hae>
+#include <errno.h>
+#include <logging.h>
+#include <string.h>
+#include <hoss.hae>
+#include <sxm.h>
+#include <time.h>
+
+#include "asg.h"
+#include "sos_prot.h"
+#include "xm_singleton.h"
+#include "cb_proxy.hae"
+#include "aasg_intnl.h"
+#include "asg_exec.hae"
+
+static __blocking int b_free(struct asgbatch *b);
+
+struct asgsvc_op {
+	struct aesop_sem sem;
+	ssm_Haddr addr;
+};
+
+static void
+asgsvc_op_semup(struct cb_proxy_data *d)
+{
+	struct asgsvc_op *op;
+
+	op = d->data.ptr;
+	aesop_sem_up(&op->sem);
+	return;
+}
+
+static __blocking int
+sync_xm_op(int (*xm_op)(struct xm_transport *, struct xm_message *),
+	   struct xm_transport *xmx, struct xm_message *m)
+{
+	struct asgsvc_op op;
+	int rc, ign;
+	struct cb_proxy_data d;
+
+	d.xm_chained_cb = NULL;
+	d.ae_cb = asgsvc_op_semup;
+	d.data.ptr = &op;
+
+	ign = aesop_sem_init(&op.sem, 0);
+	assert(ign == AE_SUCCESS);
+
+	rc = cb_proxy_op(xm_op, xmx, m, &d);
+	if (rc == 0) {
+		aesop_sem_down(&op.sem);
+	}
+	ign = aesop_sem_destroy(&op.sem);
+	return rc;
+}
+
+static __blocking int
+get_buf(struct iovec *iov, match1 bits, struct peer_record *p) {
+        struct xm_message m;
+        int rc;
+
+        while (iov->iov_base != NULL) {
+                m.flags = XM_F_IFRW;
+                m.addr = p->address;
+                m.match = bits;
+                m.iov = iov;
+                m.iovcnt = 1;
+
+                rc = sync_xm_op(xm_get, p->xmx, &m);
+                if (rc != 0) {
+                        ERR("Get of buffer failed: %s\n",
+                            strerror(-rc));
+                        break;
+                }
+                break;
+        }
+        return rc;
+}
+
+static __blocking int
+setflags(hoss_flags_t *hf, cond1 fl) {
+	int rc;
+
+	if (fl & SOS1_COND_NONE) {
+		*hf = HOSS_NONE;
+		rc++;
+	}
+	if (fl & SOS1_COND_UNTIL) {
+		*hf = HOSS_NONE;
+		rc++;
+	}
+	if (fl & SOS1_COND_ALL) {
+		*hf = HOSS_COND_ALL;
+		rc++;
+	}
+	if (fl & SOS1_UPD_AUTO) {
+		*hf = HOSS_AUTO_INC;
+		rc++;
+	}
+
+	return rc;
+}
+
+static __blocking int
+do_hoss_read(struct READ1args *arg, void *buf, hoss_size_t *nbytes_read,
+	     hoss_update_t *update_info, struct asgsvc *svc,
+	     struct hoss_grp *p, hoss_flags_t fl, 
+	     struct hoss_record_info *probe, hoss_size_t *nbytes_probed,
+	     hoss_size_t p_recs)
+{
+	struct hoss_grp *g;
+	struct hoss_oid oid;
+	hoss_eid_t eids[3];
+	int rc, urc;
+
+	eids[0] = arg->nsid.container;
+	eids[1] = arg->nsid.object;
+	eids[2] = arg->nsid.fork;
+	oid.ids = eids;
+	oid.nids = 3;
+
+	rc = hoss_begin(&g, p, 0, svc->hoss);
+	if (rc != 0) {
+		return -rc;
+	}
+
+	do {
+		rc = hoss_read(&oid,        /* struct hoss_oid *oid, */
+			       arg->at,     /* hoss_off_t start, */
+			       arg->nrecs,  /* hoss_size_t nrecs, */
+			       fl,          /* hoss_flags_t flags, */
+			       arg->update, /* hoss_update_t update_cond, */
+			       buf,         /* void *buf, */
+			       arg->bufsiz, /* hoss_size_t bufsize, */
+			       probe,       /* struct hoss_record_info *ris,*/
+			       p_recs,      /* hoss_size_t maxris, */
+			       g,           /* struct hoss_grp *grp, */
+			       nbytes_read, /* hoss_size_t *nbytes_read, */
+			       nbytes_probed,/* hoss_size_t *nris, */
+			       update_info, /* hoss_update_t *update_info, */
+			       &urc         /* int *rc */
+			       );
+
+		if (rc)
+			break;
+
+		rc = hoss_end(g, 1);
+		if (urc)
+			return urc;
+		return rc;
+	} while(0);
+	(void)hoss_end(g, 0);
+	return rc;
+}
+
+static __blocking int
+do_hoss_write(struct WRITE1args *arg, void *wbuf,
+	      hoss_size_t *nbytes_written, struct asgsvc *svc,
+	      struct hoss_grp *p, hoss_flags_t fl)
+{
+	struct hoss_grp *g;
+	struct hoss_oid oid;
+	hoss_eid_t eids[3];
+	int rc, urc, trc;
+
+	eids[0] = arg->nsid.container;
+	eids[1] = arg->nsid.object;
+	eids[2] = arg->nsid.fork;
+	oid.ids = eids;
+	oid.nids = 3;
+
+	rc = hoss_begin(&g, p, 0, svc->hoss);
+	if (rc != 0)
+		return -rc;
+
+	do {
+		rc = hoss_write(&oid,           /* struct hoss_oid *oid */
+				arg->at,        /* hoss_off_t start */
+				arg->nrecs,     /* hoss_size_t nrecs */
+				arg->rlen,      /* hoss_size_t reclen */
+				fl,             /* hoss_flags_t flags */
+				arg->updctl,    /* hoss_update_t update_cond */
+				arg->update,    /* hoss_update_t new_update */
+				wbuf,           /* const void *writebuf */
+				g,              /* struct hoss_grp *grp */
+				nbytes_written, /* hoss_size_t *nbytes_wr */
+				&urc            /* int *rc */
+				);
+
+		if (rc)
+			break;
+
+		rc = hoss_end(g, 1);
+
+		if (urc)
+			return urc;
+		return rc;
+	} while(0);
+
+	(void)hoss_end(g, 0);
+
+	return rc;
+}
+
+__blocking int
+read_svc(struct asgop *op)
+{
+	struct asgsvc *svc;
+	struct xm_message m, repl, probe;
+	struct iovec iov[3];
+	int rc;
+	bool_t enc;
+	struct READ1res *r;
+	struct READ1args *arg;
+	hoss_size_t nbytes, p_recs, nris, pbuf, i;
+	hoss_update_t updin;
+	hoss_flags_t fl;
+	struct hoss_record_info *rinfo;
+	rinfo1 *packinfo;
+	match1 ret, put, pb;
+	XDR xdrs, pxdrs;
+
+	r = &op->arg->c.result.SOS.SOSres_u.r;
+	arg = &op->arg->c.request.SOS.SOSargs_u.r;
+
+	svc = op->data;
+
+	fl = 0;
+
+	rc = setflags(&fl, arg->cond);
+
+	ret = arg->ret;
+	put = arg->match;
+	pb = 0;
+	nris = 0;
+
+	if (op->arg_present > 0) {
+		pbuf = op->ops.rs.len;
+		p_recs = pbuf/sizeof(asg_record_info_t);
+		pb = arg->probe.OPTPROBE1args_u.info.match;
+		packinfo = op->ops.rs.p1;
+		rinfo = op->ops.rs.p2;
+		probe.flags = XM_F_IFWRONLY;
+		probe.addr = op->p->address;
+		probe.match = pb;
+		probe.iov = &iov[2];
+		probe.iovcnt = 1;
+		rc = do_hoss_read(arg, op->bp[1], &nbytes, &updin, 
+				  svc, op->g, fl, rinfo, &nris, 
+				  p_recs);
+		if (nris > 0) {
+			for (i = 0; i < nris; i++) {
+				packinfo[i].rid = rinfo[i].start;
+				packinfo[i].runlen = rinfo[i].nrecs;
+				packinfo[i].rlen = rinfo[i].reclen;
+				packinfo[i].vers = rinfo[i].update_id;
+			}
+
+			xdrmem_create(&pxdrs, op->bp[2], pbuf, XDR_ENCODE);
+			
+			rc = 1;
+			for (i = 0; i < nris && rc > 0; i++) {
+				rc = xdr_rinfo1(&pxdrs, &packinfo[i]);
+			}
+			if (rc == 0) {
+				ERR("XDR of probe result failed\n");
+			}
+			
+			iov[2].iov_base = op->bp[2];
+			iov[2].iov_len = xdr_getpos(&pxdrs);
+			
+			INFO(2, "read_svc probe replying to 0x%lx\n", 
+			     probe.match);
+			rc = sync_xm_op(xm_put, op->p->xmx, &probe);
+			if (probe.error) {
+				ERR("error: %s\n", strerror(probe.error));
+			}
+			if (rc != 0) {
+				ERR("put of probe result failed: %s\n",
+				    strerror(-rc));
+			}
+		}	
+	} else {
+		p_recs = 0;
+		nris = 0;
+		rc = do_hoss_read(arg, op->bp[1], &nbytes, 
+				  &updin, svc, op->g, fl, NULL, NULL,
+				  p_recs);
+	}
+
+	r->count = nbytes;
+	r->vers = 0;
+	r->rcount = 0;
+	if (nbytes > 0) {
+		r->vers = updin;
+	}
+	if (nris > 0) {
+		r->rcount = nris;
+	}
+
+	if (rc != 0) {
+		ERR("HOSS read failed: %s\n", strerror(-rc));
+		r->status = SOS1_FAIL;
+	} else {
+		r->status = rc;
+	}
+
+	if (nbytes > 0) {
+		m.flags = XM_F_IFWRONLY;
+		m.addr = op->p->address;
+		m.match = put;
+		m.iov = &iov[0];
+		m.iovcnt = 1;
+		iov[0].iov_base = op->bp[1];
+		iov[0].iov_len = nbytes;
+
+		INFO(2, "readsvc writing buffer 0x%lx\n", put);
+		rc = sync_xm_op(xm_put, op->p->xmx, &m);
+		if (m.error) {
+			ERR("error: %s\n", strerror(m.error));
+		}
+		if (rc != 0) {
+			ERR("Put of read buffer failed: %s\n", strerror(-rc));
+		}
+	}
+	
+	xdrmem_create(&xdrs, op->bp[1], sizeof(READ1res), XDR_ENCODE);
+	
+	enc = xdr_READ1res(&xdrs, r);
+	if (enc == FALSE)  {
+		ERR("XDR of read result failed\n");
+	}
+		
+	repl.flags = XM_F_IFWRONLY;
+	repl.addr = op->p->address;
+	repl.match = ret;
+	repl.iov = &iov[1];
+	repl.iovcnt = 1;
+	iov[1].iov_base = op->bp[1];
+	iov[1].iov_len = xdr_getpos(&xdrs);
+	
+	INFO(2, "readsvc replying to 0x%lx\n", ret);
+	rc = sync_xm_op(xm_put, op->p->xmx, &repl);
+	if (repl.error) {
+		ERR("error: %s\n", strerror(repl.error));
+	}
+	if (rc != 0) {
+		ERR("Put of read result failed: %s\n", strerror(-rc));
+	}
+	
+	INFO(2, "readsvc returning %d\n", r->status);
+	
+	return 0;
+}
+
+__blocking int
+time_svc(struct asgop *op) {
+	struct asgsvc *svc;
+	struct xm_message repl;
+	struct iovec iov;
+	time_t epoch;
+	XDR xdrs;
+	bool_t enc;
+	int rc;
+	struct TIME1args *arg;
+	struct TIME1res *r;
+
+	epoch = 0;
+
+	arg = &op->arg->c.request.SOS.SOSargs_u.t;
+	r = &op->arg->c.result.SOS.SOSres_u.t;
+
+	repl.flags = XM_F_IFWRONLY;
+	repl.addr = op->p->address;
+	repl.match = arg->ret;
+	repl.iov = &iov;
+	repl.iovcnt = 1;
+
+	epoch = time(NULL);
+
+	if (epoch == (time_t)(-1))
+		r->status = SOS1_FAIL;
+	else {
+		r->status = SOS1_OK;
+		r->TIME1res_u.time = epoch;
+	}
+
+	xdrmem_create(&xdrs, op->bp[0], sizeof(TIME1res), XDR_ENCODE);
+
+	enc = xdr_TIME1res(&xdrs, r);
+	if (enc == FALSE) {
+		ERR("XDR of time result failed\n");
+	}
+
+	iov.iov_base = op->bp[0];
+	iov.iov_len = xdr_getpos(&xdrs);
+
+	rc = sync_xm_op(xm_put, op->p->xmx, &repl);
+
+	if (repl.error) {
+		ERR("error: %s\n", strerror(repl.error));
+	}
+	if (rc != 0) {
+		ERR("Put of time result failed: %s\n", strerror(-rc));
+	}
+
+	if (r->status == SOS1_OK) {
+		free(op->buf);
+		op->buf = NULL;
+	}
+
+	INFO(2, "timesvc returning %d\n", r->status);
+
+	return 0;
+}
+
+/* Always returns 0. Errors are indicated in return structure. */
+__blocking int
+write_svc(struct asgop *op)
+{
+	struct asgsvc *svc;
+	struct xm_message repl;
+	struct iovec iov;
+	int rc;
+	bool_t enc, dec;
+	struct WRITE1res *r;
+	struct WRITE1args *arg;
+	hoss_size_t nbytes;
+	size_t dbufsiz;
+	match1 ret;
+	XDR xdrs;
+	hoss_flags_t fl;
+	
+	r = &op->arg->c.result.SOS.SOSres_u.w;
+	arg = &op->arg->c.request.SOS.SOSargs_u.w;
+	ret = arg->ret;
+
+	svc = op->data;
+
+	dbufsiz = arg->nrecs * arg->rlen;
+
+	fl = 0;
+
+	rc = setflags(&fl, arg->cond);
+
+	rc = do_hoss_write(arg, op->bp[0], &nbytes, 
+			   svc, op->g, fl);
+
+	if (rc != 0) {
+		INFO(2, "hoss write failed: %s\n", strerror(-rc));
+		r->status = SOS1_FAIL;
+	} else {
+		r->status = rc;
+		r->vers = arg->update;
+		r->count = nbytes;
+	}
+
+	xdrmem_create(&xdrs, op->bp[1], sizeof(WRITE1res), XDR_ENCODE);
+
+	enc = xdr_WRITE1res(&xdrs, r);
+	if (enc == FALSE) {
+		ERR("XDR of write result failed: %s\n", strerror(-rc));
+	}
+
+	repl.flags = XM_F_IFWRONLY;
+	repl.addr = op->p->address;
+	repl.match = ret;
+	repl.iov = &iov;
+	repl.iovcnt = 1;
+	iov.iov_base = op->bp[1];
+	iov.iov_len = xdr_getpos(&xdrs);
+
+	INFO(2, "writesvc replying to 0x%lx\n", ret);
+	rc = sync_xm_op(xm_put, op->p->xmx, &repl);
+	if (repl.error) {
+		ERR("error: %s\n", strerror(repl.error));
+	}
+	if (rc != 0) {
+		ERR("Put of write result failed: %s\n", strerror(-rc));
+	}
+
+	INFO(2, "writesvc returning %d\n", r->status);
+
+	return 0;
+}
+
+static __blocking int _batch_bail(struct asgbatch *b, const char *caller) {
+	b_free(b);
+
+	INFO(2, "batch_svc %s returning %d\n", caller, SOS1_FAIL);
+	return SOS1_FAIL;
+}
+
+static __blocking int _g_svc(struct asgbatch *b, BATCH1res *r, 
+			     __blocking int (*f)(struct asgop *),
+			     const char *caller) {
+	int rc;
+	struct asgop *op;
+
+	TAILQ_FOREACH(op, &(b->ops), entries) {
+		rc = f(op);
+		if (rc) {
+			(void )_batch_bail(b, caller);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static __blocking int _batch_exec(struct asgbatch *b, BATCH1res *r) {
+	int rc;
+
+	rc = _g_svc(b, r, prealloc, "prealloc");
+	if (rc)
+		return -1;
+
+	rc = _g_svc(b, r, prefetch, "prefetch");
+	if (rc)
+		return -1;
+
+
+	rc = _g_svc(b, r, op_exec, "op_exec");
+	if (rc) 
+		return -1;
+
+	r->status = SOS1_OK;
+	INFO(2, "batch_svc returning %d\n", r->status);
+
+	return 0;
+}
+
+static __blocking int _batch_svc(struct asgbatch *b, XDR *xdrs,
+				 struct asgsvc *svc, BATCH1res *r) {
+	int rc;
+	struct asgop *op;
+	struct asgarg *arg;
+	size_t i;
+	
+	rc = 1;
+	while (rc > 0) {
+		op = malloc(sizeof(struct asgop));
+		arg = malloc(sizeof(struct asgarg));
+		if (op == NULL || arg == NULL) {
+			free(op);
+			free(arg);
+			r->status = SOS1_FAIL;
+			INFO(2, "batch_svc xdr returning %d\n", 
+			     r->status);
+			return -1;
+		}
+		op->arg_present = 0;
+		op->arg = arg;
+		rc = xdr_SOSargs(xdrs, &op->arg->c.request.SOS);
+		op->p = &b->p; //peer record
+		op->data = svc; //asgsvc
+		op->g = b->g; //parent hoss grp
+		op->buf = NULL;
+		if (rc > 0) {
+			op->op = op->arg->c.request.SOS.op;
+			TAILQ_INSERT_TAIL(&(b->ops), op, entries);
+		}
+	}
+	free(op);
+	free(arg);
+
+	rc = _batch_exec(b, r);
+
+	if (rc) {
+		r->status = SOS1_FAIL;
+		return -1;
+	}
+
+        return 0;
+}
+
+__blocking int
+batch_svc(struct asgop *op) {
+	BATCH1args *arg;
+	BATCH1res *r;
+	struct asgsvc *svc;
+	struct asgbatch b;
+	struct asgop *b_op;
+	struct asgarg *b_arg;
+	void *cmdbuf;
+        int rc;
+	XDR xdrs;
+
+	svc = (struct asgsvc *)op->data;
+
+	arg = &op->arg->c.request.SOS.SOSargs_u.b;
+	r = &op->arg->c.result.SOS.SOSres_u.b;
+
+	cmdbuf = op->bp[0];
+
+	TAILQ_INIT(&b.ops);
+
+	rc = hoss_begin(&b.g, NULL, 0, svc->hoss);
+	if (rc) {
+		free(op->buf);
+		r->status = SOS1_FAIL;
+		INFO(2, "batch_svc hoss returning %d\n", r->status);
+		return 0;
+	}
+
+	xdrmem_create(&xdrs, cmdbuf, arg->bufsiz, XDR_DECODE);
+
+	INFO(2, "creating thread pool\n");
+	b.t = aethread_create_group_pool(1);
+
+	if (b.t == NULL) {
+		free(op->buf);
+		free(op);
+		r->status = SOS1_FAIL;
+		INFO(2, "batch_svc aethread_create_group_pool returning %d\n",
+		     r->status);
+		return 0;
+	}
+		
+	pwait {
+		pbranch {
+			aethread_hint(b.t);
+			rc = _batch_svc(&b, &xdrs, svc, r);
+		}
+	}
+
+	if (rc) {
+		(void )hoss_end(b.g, 0);
+		b_free(&b);
+	}
+
+	aethread_destroy_group(b.t);
+
+        return 0;
+}
+
+__blocking void
+asg_putback(struct asgarg *asgargs, struct peer_record *p, void *data,
+	    xdrproc_t proc, enum svc_flags f)
+{
+	XDR xdrs;
+	size_t len;
+	char *buf;
+	struct iovec iov;
+	struct xm_message m;
+	int rc;
+
+	len = xdr_sizeof(proc, &asgargs->c);
+	if (f & SVC_ADD_HEADER)
+		len += xdr_sizeof((xdrproc_t)xdr_msg_header,
+				  &asgargs->msg_header);
+	buf = malloc(len);
+	if (buf == NULL) {
+		ERR("Could not malloc %lu bytes\n", len);
+		return;
+	}
+
+	xdrmem_create(&xdrs, buf, len, XDR_ENCODE);
+	if ((f & SVC_ADD_HEADER) &&
+	    !xdr_msg_header(&xdrs, &asgargs->msg_header)) {
+		ERR("Could not XDR\n");
+		return;
+	}
+
+	if (!(proc(&xdrs, &asgargs->c))) {
+		ERR("Could not XDR\n");
+		return;
+	}
+
+	assert(len == xdr_getpos(&xdrs));
+	m.flags = XM_F_IFRW;
+	m.addr = p->address;
+	m.match = asgargs->msg_header.reply;
+	m.iov = &iov;
+	iov.iov_base = buf;
+	iov.iov_len = len;
+	m.iovcnt = 1;
+
+	rc = sync_xm_op(xm_put, p->xmx, &m);
+	if (rc) {
+		abort();
+	}
+	free(buf);
+	return;
+}
+
+__blocking int 
+prealloc(struct asgop *op) {
+	size_t len, num_ops_arg;
+	WRITE1args *w;
+	len = 0;
+        switch (op->op) {
+        case SOS1_WRITE:
+		len = op->arg->c.request.SOS.SOSargs_u.w.nrecs * 
+			op->arg->c.request.SOS.SOSargs_u.w.rlen + 
+			sizeof(WRITE1res);
+		op->bps = 2;
+                op->buf = malloc(len);
+                if (op->buf == NULL) {
+                        errno = ENOMEM;
+                        return -1;
+		}
+		memset(op->buf, 0, len);
+		op->bp[0] = op->buf;
+		op->bp[1] = op->buf + 
+			(op->arg->c.request.SOS.SOSargs_u.w.nrecs * 
+			 op->arg->c.request.SOS.SOSargs_u.w.rlen);
+                break;
+        case SOS1_READ:
+		len = op->arg->c.request.SOS.SOSargs_u.r.bufsiz +
+			sizeof(READ1res);
+		op->bps = 2;
+		if (op->arg->c.request.SOS.SOSargs_u.r.probe.present > 0) {
+			op->ops.rs.len = op->arg->c.request.SOS.SOSargs_u.r.
+				probe.OPTPROBE1args_u.info.bufsiz;
+			num_ops_arg = op->ops.rs.len/
+				sizeof(asg_record_info_t);
+			op->ops.rs.p1 = malloc(sizeof(asg_record_info_t)*
+					       num_ops_arg);
+			if (op->ops.rs.p1 == NULL) {
+				errno = ENOMEM;
+				return -1;
+			}
+			op->ops.rs.p2 = malloc(sizeof(struct hoss_record_info)
+					       *num_ops_arg);
+			if (op->ops.rs.p2 == NULL) {
+				free(op->ops.rs.p1);
+				errno = ENOMEM;
+				return -1;
+			}
+			op->bps = 3;
+			op->arg_present = 1;
+			len += op->arg->c.request.SOS.SOSargs_u.r.probe.
+				OPTPROBE1args_u.info.bufsiz;
+		}
+
+                op->buf = malloc(len);
+		if (op->buf == NULL) {
+			if (op->arg_present > 0) {
+				free(op->ops.rs.p1);
+				free(op->ops.rs.p2);
+			}
+			errno = ENOMEM;
+			INFO(2, "prealloc: %s\n", 
+			     strerror(errno));
+			return -1;
+		}
+		memset(op->buf, 0, len);
+		op->bp[0] = op->buf;
+		op->bp[1] = op->buf + sizeof(READ1res);
+		if (op->bps == 3) {
+			op->bp[2] = op->bp[1]+
+				op->arg->c.request.SOS.SOSargs_u.r.bufsiz;
+		}
+		break;
+        case SOS1_BATCH:
+		len = op->arg->c.request.SOS.SOSargs_u.b.bufsiz + 
+			sizeof(BATCH1res);
+		op->bps = 2;
+                op->buf = malloc(len);
+                if (op->buf == NULL) {
+                        errno = ENOMEM;
+                        return -1;
+                }
+		memset(op->buf, 0, len);
+		op->bp[0] = op->buf;
+		op->bp[1] = op->buf + op->arg->c.request.SOS.SOSargs_u.b.bufsiz;
+                break;
+	case SOS1_TIME:
+		len = sizeof(TIME1res);
+		op->bps = 1;
+		op->buf = malloc(len);
+		if (op->buf == NULL) {
+			errno = ENOMEM;
+			return -1;
+		}
+		memset(op->buf, 0, len);
+		op->bp[0] = op->buf;
+		break;		
+        default:
+		ERR("unrecognized op: %d\n", op->op);
+                return -1;
+                break;
+        }
+        return 0;
+}
+
+__blocking int 
+prefetch(struct asgop *op) {
+        struct iovec iov;
+	int stat;
+	struct WRITE1args *w;
+	unsigned present;
+
+        switch (op->op) {
+        case SOS1_WRITE:
+		w = &op->arg->c.request.SOS.SOSargs_u.w;
+                if (op->buf == NULL) {
+                        errno = EFAULT;
+                        return -1;
+                }
+                iov.iov_base = op->bp[0];
+                iov.iov_len = w->nrecs * w->rlen;
+                return get_buf(&iov, w->match, op->p);
+                break;
+        case SOS1_BATCH:
+                if (op->buf == NULL) {
+                        errno = EFAULT;
+                        return -1;
+                }
+                iov.iov_base = op->bp[1];
+                iov.iov_len = op->arg->c.request.SOS.SOSargs_u.b.bufsiz;
+		
+		return get_buf(&iov, 
+			       op->arg->c.request.SOS.SOSargs_u.b.cmdbuf,
+			       op->p);
+		break;
+        default:
+                return 0; //no buf to populate
+        }
+        return 0;
+}
+
+__blocking int
+op_exec(struct asgop *op) {
+        switch (op->op) {
+        case SOS1_WRITE:
+                return write_svc(op);
+                break;
+        case SOS1_READ:
+                return read_svc(op);
+                break;
+        case SOS1_BATCH:
+                return batch_svc(op);
+                break;
+        default:
+                return -1;
+        }
+
+        return 0;
+}
+
+static __blocking void op_free(struct asgop *op) {
+	if (op == NULL)
+		return;
+	if (op->arg != NULL)
+		free(op->arg);
+	if (op->buf != NULL)
+		free(op->buf);
+	if (op->arg_present > 0) {
+		if (op->op == SOS1_READ) {
+			if (op->ops.rs.p1 != NULL)
+				free(op->ops.rs.p1);
+			if (op->ops.rs.p2 != NULL)
+				free(op->ops.rs.p2);
+		}
+	}
+	free(op);
+	return;
+}
+
+static __blocking int b_free(struct asgbatch *b) {
+	struct asgop *op;
+
+	while ((op = TAILQ_FIRST(&b->ops)) != NULL) {
+		TAILQ_REMOVE(&b->ops, op, entries);
+		op_free(op);
+	}
+
+	if (b->retbuf != NULL)
+		free(b->retbuf);
+	free(b);
+	return 0;
+}
+
+static __blocking int _sos_svc(struct asgbatch *b,
+			       struct asgsvc *svc, BATCH1res *r,
+			       BATCH1args *a, void *cmdbuf,
+			       struct peer_record *p, void *data) {
+	struct asgop *op;
+	struct asgarg *arg;
+	struct hoss_oid id;
+	hoss_eid_t ids[3];
+	XDR xdrs;
+	int rc, err;
+
+	if (a->bufsiz > 0) {
+		xdrmem_create(&xdrs, cmdbuf, a->bufsiz, XDR_DECODE);
+
+		rc = _batch_svc(b, &xdrs, svc, r);
+	}
+
+	return 0;
+}
+
+/* always returns 0, errors indicated in return status */
+__blocking int
+sos_svc(struct asgarg *asgargs, struct peer_record *p, void *data) 
+{
+	BATCH1args *b;
+	BATCH1res *r;
+	size_t i;
+	struct asgsvc *svc;
+	struct asgbatch *bx;
+	struct iovec iov;
+	size_t bufsiz;
+	void *cmdbuf;
+        int rc, err, stat;
+	XDR xdrs;
+	
+	cmdbuf = NULL;
+	
+	stat = 0;
+	svc = (struct asgsvc *)data;
+	
+	b = &asgargs->c.request.BATCH;
+	r = &asgargs->c.result.BATCH;
+	
+	if (b->bufsiz) {
+		cmdbuf = malloc(b->bufsiz);
+		if (cmdbuf == NULL) {
+			ERR("Alloc of command buffer failed: %s\n", 
+			    strerror(-ENOMEM));
+			r->status = SOS1_FAIL;
+			return 0;
+		}
+		
+		iov.iov_base = cmdbuf;
+		iov.iov_len = b->bufsiz;
+		
+		rc = get_buf(&iov, b->cmdbuf, p);
+		if (rc) {
+			free(cmdbuf);
+			r->status = SOS1_FAIL;
+			INFO(2, "sos_svc returning %d\n", r->status);
+			return 0;
+		}
+	}
+	
+	bx = malloc(sizeof(struct asgbatch));	
+	if (bx == NULL) {
+		if (b->bufsiz) 
+			free(cmdbuf);
+		r->status = SOS1_FAIL;
+		INFO(2, "sos_svc returning %d\n", r->status);
+		return 0;
+	}
+	
+	bx->retbuf = NULL;
+	TAILQ_INIT(&bx->ops);
+	
+	INFO(2, "creating thread pool\n");
+	bx->t = aethread_create_group_pool(1);
+	
+	if (bx->t == NULL) {
+		free(bx);
+		r->status = SOS1_FAIL;
+		INFO(2, "sos_svc returning %d\n", r->status);
+	}
+	
+	bx->p.xmx = p->xmx;
+	bx->p.address = ssm_addr_cp(p->xmx->ssm,
+				    p->address);
+	
+	rc = hoss_begin(&bx->g, NULL, 0, svc->hoss);
+	if (rc) {
+		if (b->bufsiz)
+			free(cmdbuf);
+		free(bx);
+		INFO(2, "sos_svc hoss returning %d\n", r->status);
+	}
+	
+	pwait {
+		pbranch {
+			aethread_hint(bx->t);
+			rc = _sos_svc(bx, svc, r, b, cmdbuf, p, data);
+		}
+	}
+	
+	if (rc) {
+		INFO(2, "destroying batch on %d\n", rc);
+		b_free(bx);
+	} else if (rc == 0) {
+		INFO(2, "destroying batch\n");
+		aethread_destroy_group(bx->t);
+		ssm_addr_destroy(bx->p.xmx->ssm,
+				 bx->p.address);
+		(void )hoss_end(bx->g, 1);
+		b_free(bx);
+	}
+	
+	free(cmdbuf);
+
+	INFO(2, "sos_svc returning %d\n", r->status);
+
+        return 0;
+}

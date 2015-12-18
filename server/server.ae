@@ -1,0 +1,512 @@
+#include <aesop/aesop.h>
+#include <aesop/aethread.hae>
+#include <aesop/timer.hae>
+#include <aesop/sem.hae>
+#include <errno.h>
+#include <hoss.hae>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sxm.h>
+#include <ssm.h>
+#include <ssmptcp.h>
+#include <idb.h>
+
+#include "xm_singleton.h"
+#include "xmu_addr.h"
+#include "xmu_obj_pools.h"
+#include "sos_prot.h"
+#include "aasg_intnl.h"
+#include "asg_exec.hae"
+#include "cb_proxy.hae"
+#include "signal_shutdown.hae"
+#include "sos_prot.h"
+
+#define LOG_PREFIX "server"
+
+#include "logging.h"
+
+int log_lvl; /* Set by verbosity */
+pid_t PID;
+
+static void
+log_cmd(int argc, char **argv)
+{
+	char *str;
+	size_t i, acc = 0;
+	for (i = 0; i < (size_t)argc; i++)
+		acc += strlen(argv[i]) + 1;
+	str = malloc(acc);
+	if (str == NULL || acc == 0)
+		abort();
+	str[0] = '\0';
+	strncat(str, argv[0], acc);
+	for (i = 1; i < (size_t)argc; i++) {
+		strncat(str, " ", acc);
+		strncat(str, argv[i], acc);
+	}
+	INFO(INFO_ONCE, "%s\n", str);
+	free(str);
+}
+
+#define BAIL(msg, err) do {						\
+		ERR(msg ": %s (%i)\n", strerror(err), err);		\
+		abort();						\
+	} while(0)
+
+#define UNEX_MBITS AASG_UXID
+#define NUNEX 15
+#define UNEX_MSIZE AASG_RAWBUFSIZ
+
+#define NEVENTLOOPS 16
+struct xm_match_entry *unex_me;
+struct hoss_ctx *hoss;
+
+struct requests {
+	TAILQ_HEAD(uq_th, asgarg) outstanding_tqh;
+	size_t nreqs;
+	pthread_mutex_t ev_m;
+	pthread_cond_t ev_c;
+	struct aethread_group *workers;
+} rqs;
+
+static int
+aeux_init(void)
+{
+
+	TAILQ_INIT(&rqs.outstanding_tqh);
+	rqs.nreqs = 0;
+	if (pthread_mutex_init(&rqs.ev_m, NULL) ||
+	    pthread_cond_init(&rqs.ev_c, NULL))
+		abort();
+	rqs.workers = aethread_create_group_pool(16);
+	if (rqs.workers == NULL)
+		return -errno;
+	return 0;
+}
+
+static void
+aeux_fini(void)
+{
+
+	aethread_destroy_group(rqs.workers);
+	return;
+}
+
+size_t max_proc = 0;
+struct asg_proc_entry {
+	unsigned proc;
+	xdrproc_t xdr_args;
+	__blocking int (*svc)(struct asgarg *, struct peer_record *, void *);
+	xdrproc_t xdr_reply;
+};
+const struct asg_proc_entry **asg_procs = NULL;
+
+const struct asg_proc_entry known_procs[] = {
+	{0, NULL, NULL, NULL},
+	{
+		SOSBATCH1_OP,
+		(xdrproc_t)xdr_BATCH1args,
+		sos_svc,
+		(xdrproc_t)xdr_BATCH1res
+	},
+};
+
+#define MLCMAX(a,b) ((a) > (b) ? (a) : (b))
+
+static int
+create_asg_proc_entries(void)
+{
+	size_t i, nprocs = sizeof(known_procs) / sizeof(known_procs[0]);
+	size_t len;
+	unsigned procid;
+
+	for (i = 0; i < nprocs; i++) {
+		max_proc = MLCMAX(max_proc, known_procs[i].proc);
+	}
+	if (max_proc > (1 << 10)) {
+		WARN("Rather large number of procs (%lu) defined\n",
+		     max_proc);
+	}
+	len = (max_proc + 1) * sizeof(asg_procs[0]);
+	asg_procs = malloc(len);
+	if (asg_procs == NULL) {
+		ERR("Could not alloc proc table (%lub)\n", len);
+		return -errno;
+	}
+	for (i = 0; i <= max_proc; i++)
+		asg_procs[i] = NULL;
+	for (i = 0; i < nprocs; i++) {
+		procid = known_procs[i].proc;
+		assert(procid <= max_proc);
+		assert(asg_procs[procid] == NULL);
+		asg_procs[procid] = known_procs + i;
+	}
+	INFO(INFO_ONCE, "Initialized %lu proc entries\n", nprocs);
+	return 0;
+}
+
+static const struct asg_proc_entry *
+get_asg_proc_entry(uint32_t procid)
+{
+	if (procid > max_proc)
+		return NULL;
+	return asg_procs[procid];
+}
+
+static void
+destroy_asg_proc_entries(void)
+{
+	free(asg_procs);
+}
+
+static void
+aeux_add(struct asgarg *arg)
+{
+
+	pthread_mutex_lock(&rqs.ev_m);
+	TAILQ_INSERT_TAIL(&rqs.outstanding_tqh, arg, entries);
+	if (rqs.nreqs++ == 0)
+		pthread_cond_broadcast(&rqs.ev_c);
+	pthread_mutex_unlock(&rqs.ev_m);
+}
+
+static void
+aeux_kickout(void)
+{
+	pthread_mutex_lock(&rqs.ev_m);
+	pthread_cond_broadcast(&rqs.ev_c);
+	pthread_mutex_unlock(&rqs.ev_m);
+}
+
+static __blocking struct asgarg *
+aeux_get(void)
+{
+	int rc;
+	struct asgarg *arg = NULL;
+
+	pwait {
+		pbranch {
+			aethread_hint(rqs.workers);
+			pthread_mutex_lock(&rqs.ev_m);
+			while (rqs.nreqs == 0 &&
+			       !signal_shutdown_signaled()) {
+				pthread_cond_wait(&rqs.ev_c, &rqs.ev_m);
+			}
+			if (rqs.nreqs != 0) {
+				arg = rqs.outstanding_tqh.tqh_first;
+				TAILQ_REMOVE(&rqs.outstanding_tqh, arg,
+					     entries);
+				rqs.nreqs--;
+			}
+			pthread_mutex_unlock(&rqs.ev_m);
+		}
+	}
+	return arg;
+}
+
+static void
+cb(struct xm_transport *xmx, struct xm_message *m)
+{
+	bool_t rc;
+	XDR xdrs;
+	const struct asg_proc_entry *proc;
+	int err;
+
+	struct asgarg *arg = malloc(sizeof(*arg));
+	if (arg == NULL) {
+		ERR("Could not alloc arg %lu\n", sizeof(*arg));
+		return;
+	}
+	/* Not totally portable way to get NULL pointers into struct
+	 * for XDR to alloc. TODO: Initializer routines for XDR types
+	 */
+	memset(arg, '\0', sizeof(*arg));
+	arg->xmx = xmx;
+
+	do {
+		err = 1;
+		xdrmem_create(&xdrs, ((char *)m->iov->iov_base), m->len,
+			      XDR_DECODE);
+		if (xdr_msg_header(&xdrs, &arg->msg_header) == 0) {
+			ERR("Discarding message: has no header\n");
+			break;
+		}
+		if (arg->msg_header.proc > max_proc) {
+			ERR("Discarding message: invalid proc ID\n");
+			break;
+		}
+		proc = asg_procs[arg->msg_header.proc];
+		if (proc == NULL) {
+			ERR("Discarding message: invalid proc ID\n");
+			break;
+		}
+		if (proc->xdr_args(&xdrs, &arg->c.request) == 0) {
+			ERR("Discarding message: unable to deserialize\n");
+			break;
+		}
+		arg->address = ssm_addr_cp(xmx->ssm, m->addr);
+		if (arg->address == NULL)
+			break;
+		aeux_add(arg);
+		err = 0;
+	} while(0);
+
+	if (err) {
+		free(arg);
+	}
+	rc = xm_match_add_to_pool(unex_me, m);
+	if (rc) {
+		ERR("Couldn't add buffer back to unex pool (%s)\n",
+		    strerror(-rc));
+	}
+	return;
+}
+
+static __blocking void
+event_loop(void)
+{
+	int rc, doret;
+	struct asgarg *arg;
+	struct peer_record p;
+	struct asgsvc svc;
+	const struct asg_proc_entry *pe;
+
+	do {
+		arg = aeux_get();
+		if (arg == NULL)
+			continue;
+		p.xmx = arg->xmx;
+		p.address = arg->address;
+		svc.hoss = hoss;
+
+		pe = get_asg_proc_entry(arg->msg_header.proc);
+		if (pe != NULL) {
+			doret = pe->svc(arg, &p, &svc);
+			if (doret == SVC_REPLY) {
+				INFO(INFO_N, "Replying to message\n");
+				asg_putback(arg, &p, &svc, pe->xdr_reply, 0);
+				xdr_free(pe->xdr_reply, (char *)(&arg->c));
+			} else if (doret == SVC_FORWARD) {
+				INFO(INFO_N, "Forwarding message args\n");
+				if (arg->msg_header.reply != AASG_UXID)
+					WARN("Expected AASG_UXID, got %lux\n",
+					     arg->msg_header.reply);
+				asg_putback(arg, &p, &svc, pe->xdr_args,
+					    SVC_ADD_HEADER);
+				xdr_free(pe->xdr_args, (char *)(&arg->c));
+			} else if (doret == SVC_DROP) {
+				/* Nothing */
+				INFO(INFO_N, "Dropping message response\n");
+			} else {
+				ERR("Invalid response from proc id %u\n",
+				    pe->proc);
+			}
+		}
+		ssm_addr_destroy(p.xmx->ssm, p.address);
+		free(arg);
+	} while(!signal_shutdown_signaled());
+	return;
+}
+
+static void
+usage(char *progname)
+{
+	fprintf(stderr, "Usage: %s [-v] <listen_port> [-j joinaddress] "
+		"<path_to_storage>\n", progname);
+	fprintf(stderr, "Specify multiple -v's to get more debug output\n");
+	return;
+}
+
+struct progargs {
+	char *port;
+	char *path;
+	char *joinpoint;
+	size_t verbosity;
+};
+
+static int
+parseargs(int argc, char **argv, struct progargs *pa)
+{
+	int opt;
+	pa->verbosity = 0;
+	pa->joinpoint = NULL;
+	while((opt = getopt(argc, argv, "vj:")) != -1) {
+		switch (opt) {
+		case 'v':
+			pa->verbosity++;
+			break;
+		case 'j':
+			pa->joinpoint = optarg;
+			WARN("-j currently has no effect.\n");
+			break;
+		default:
+			return -1;
+		}
+	}
+	if (argc - optind != 2) {
+		fprintf(stderr, "Invalid number of arguments.\n");
+		return -1;
+	}
+	pa->port = argv[optind++];
+	pa->path = argv[optind++];
+	assert(optind == argc);
+	return 0;
+}
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	int rc;
+	long lport;
+	char *ctmp;
+	struct xm_transport *xmx;
+	struct xmu_buf_pool unex_pool;
+	size_t nonline, i;
+	struct progargs pa;
+	ssm_Haddr joinaddr;
+
+	PID = getpid();
+
+	if (parseargs(argc, argv, &pa)) {
+		usage(argv[0]);
+		exit(1);
+	}
+	log_lvl = pa.verbosity;
+
+	lport = strtol(pa.port, &ctmp, 10);
+	if (lport <= 0 || lport > UINT16_MAX || *ctmp != '\0') {
+		fprintf(stderr, "Invalid value for port %s\n",
+			pa.port);
+		usage(argv[0]);
+		exit(1);
+	}
+
+	log_cmd(argc, argv);
+	rc = create_asg_proc_entries();
+	if (rc)
+		BAIL("create_asg_proc_entries", -rc);
+	rc = aesop_sem_module_init();
+	if (rc)
+		BAIL("sem_module_init", rc);
+	rc = aethread_init();
+	if (rc)
+		BAIL("aethread_init", rc);
+	rc = aesop_timer_init();
+	if (rc)
+		BAIL("aesop_timer_init", rc);
+	(void)signal_shutdown_init();
+
+	rc = xmtcp_start(&xmx, (uint16_t)lport);
+	if (rc)
+		BAIL("xmtcp_start\n", -rc);
+
+	rc = xms_start(xmx);
+	if (rc)
+		BAIL("xms_start", -rc);
+
+	cb_proxy_init();
+
+	xms_get();
+	xms_put();
+	/* start storage */
+	rc = hoss_init(&hoss, pa.path);
+	if (rc) {
+		fprintf(stderr, "Could not start storage at %s: %s\n",
+			pa.path, strerror(rc));
+		usage(argv[0]);
+		exit(1);
+	}
+
+	/* Start an unexpected queue (ae) */
+	rc = aeux_init();
+	if (rc)
+		BAIL("aeux_init", -rc);
+
+	/* Start an unexpected queue (XM) */
+	xms_get();
+	rc = xm_match_create(xmx, UNEX_MBITS, 0, &unex_me);
+	if (rc)
+		BAIL("xm_match_create", -rc);
+
+	rc = xm_match_insert(unex_me, XM_MATCH_HEAD, NULL);
+	if (rc != 0)
+		BAIL("xm_match_insert", -rc);
+	rc = xmu_buf_pool_construct(
+		unex_me,
+		&unex_pool,
+		NUNEX,
+		UNEX_MSIZE,
+		cb,
+		NULL,
+		&nonline);
+	if (rc || nonline != NUNEX)
+		BAIL("xmu_buf_pool_construct", -rc);
+
+	if (pa.joinpoint != NULL) {
+		rc = xmu_parse_addr(pa.joinpoint, xmx, &joinaddr);
+		if (rc != 0) {
+			fprintf(stderr, "Could not parse join address %s\n",
+				pa.joinpoint);
+			usage(argv[0]);
+			exit(1);
+		}
+	} else {
+		joinaddr = NULL;
+	}
+
+	xms_put();
+
+	pwait {
+		pbranch {
+			cb_proxy_service();
+			INFO(INFO_ONCE, "Proxy service ended\n");
+		}
+		for (i = 0; i < NEVENTLOOPS; i++) {
+			pbranch {
+				event_loop();
+			}
+		}
+		pbranch {
+			int trc;
+			do {
+				trc = signal_shutdown_wait();
+			} while(!signal_shutdown_signaled());
+			INFO(INFO_ONCE, "Attempting to end proxy service\n");
+			cb_proxy_signal_stop();
+			INFO(INFO_ONCE, "Attempting to end event loop\n");
+			aeux_kickout();
+		}
+	}
+	INFO(INFO_ONCE, "Out of server loop\n");
+	/* Stop an unexpected queue (xm) */
+	rc = xmu_buf_pool_destroy(&unex_pool, &nonline);
+	if (rc || nonline != 0)
+		abort();
+
+	/* Stop an unexpected queue (ae) */
+	aeux_fini();
+
+	/* stop storage */
+	hoss_fini(hoss);
+
+	/* Stop transport */
+	rc = xms_stop();
+	if (rc)
+		abort();
+
+	cb_proxy_fini();
+	aesop_sem_module_finalize();
+	aesop_timer_finalize();
+	aethread_finalize();
+	destroy_asg_proc_entries();
+	ssm_addr_destroy(xmx->ssm, joinaddr);
+	xm_stop(xmx);
+
+	return 0;
+}
+
+aesop_main_set(aemain);

@@ -1,0 +1,42 @@
+This software is PROTOTYPE SOFTWARE and may misbehave in interesting
+ways, up to and including destroying data. This software should not be
+used for important tasks, nor should it be used on important
+systems. This software comes with no warranty.
+
+BUILDING
+========
+
+0. This software depends on the Aesop compiler, version 0.2.1. To
+   install in the project directory, run ./install-aesop.sh. To only
+   download the materials required to install offline, run
+   ./install-aesop.sh --no-build, then at the offline machine run
+   ./install-aesop.sh.
+
+1. Several packages were designed to be distributed independently, but
+   are bundled with this release. To install them, run
+   ./install-deps.sh. Unlike the previous step, this does not depend
+   on an internet connection.
+
+2. Run make.
+
+NOTABLE FILES
+=============
+server/server  - The storage server executable.
+
+include/asg.h  - The ASG object storage API, detailed in Karakoyunlu et
+                 al., "Toward a unified object storage foundation for
+                 scalable storage systems," Cluster 2013. aasg.h also
+                 has support structures defined.
+
+sos/randtest.c
+sos/testit.c   - Example clients that use the ASG API to work with
+                 storage.
+
+COMPILING A CLIENT
+==================
+To compile a client using the ASG API, use the following incantantions:
+
+export LDLIBS="-lsxm -lsos -lssmptcp -lssm -lpthread -lrt"
+export LDFLAGS="-L${PATH_TO_REPO}/lib"
+export CPPFLAGS="-I${PATH_TO_REPO}/include"
+make testit

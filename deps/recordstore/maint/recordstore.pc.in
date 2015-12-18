@@ -1,0 +1,12 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: recordstore
+Description: Abstraction for local storage of records
+Version: 0.1
+URL: http://www.mcs.anl.gov/projects/triton/
+Requires: aesop c-utils
+Libs: -L${libdir} -lrecordstore
+Cflags: -I${includedir}

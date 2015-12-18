@@ -1,0 +1,191 @@
+/* Reproducer by Geoff Danielson. Write failed because update ID was
+ * zero, which was less than HOSS_UPDATE_MIN. Update ID zero should be
+ * valid. Fixed in commit b975e40ccfb96d5890b51f20ee12302db54bf959.
+ */
+
+#include <aesop/aesop.h>
+#include <aesop/aethread.hae>
+#include <aesop/timer.hae>
+#include <aesop/sem.hae>
+#include <errno.h>
+#include <hoss.hae>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#define NREC 65536
+#define RLEN 1
+
+struct hoss_ctx *hoss;
+
+struct asgsvc {
+  struct hoss_ctx *hoss;
+};
+
+/* types */
+typedef uint64_t entity1;
+typedef uint64_t size1;
+typedef uint64_t update1;
+typedef uint64_t match1;
+typedef uint64_t rvers1;
+typedef uint64_t rid1;
+typedef uint64_t time1;
+typedef uint32_t proc1;
+
+enum cond1 {
+  SOS1_COND_NONE = 0,
+  SOS1_COND_UNTIL = 1,
+  SOS1_COND_ALL = 2,
+};
+typedef enum cond1 cond1;
+
+enum updctl1 {
+  SOS1_UPD_NONE = 0,
+  SOS1_UPD_AUTO = 1,
+};
+typedef enum updctl1 updctl1;
+
+struct nsid1 {
+  entity1 container;
+  entity1 object;
+  entity1 fork;
+};
+typedef struct nsid1 nsid1;
+
+struct WRITE1args {
+  nsid1 nsid;
+  rid1 at;
+  size1 nrecs;
+  size1 rlen;
+  cond1 cond;
+  updctl1 updctl;
+  update1 update;
+  match1 match;
+  match1 ret;
+};
+typedef struct WRITE1args WRITE1args;
+
+/* end types */
+
+static __blocking int
+do_hoss_write(struct WRITE1args *arg, void *wbuf,
+              hoss_size_t *nbytes_written, struct asgsvc *svc,
+              struct hoss_grp *p, hoss_flags_t fl)
+{
+  struct hoss_grp *g;
+  struct hoss_oid oid;
+  hoss_eid_t eids[3];
+  int rc, urc, trc;
+
+  eids[0] = arg->nsid.container;
+  eids[1] = arg->nsid.object;
+  eids[2] = arg->nsid.fork;
+  oid.ids = eids;
+  oid.nids = 3;
+
+  rc = hoss_begin(&g, p, 0, svc->hoss);
+  if (rc != 0)
+    return -rc;
+
+  do {
+    rc = hoss_write(&oid,           /* struct hoss_oid *oid */
+		    arg->at,        /* hoss_off_t start */
+		    arg->nrecs,     /* hoss_size_t nrecs */
+		    arg->rlen,      /* hoss_size_t reclen */
+		    fl,             /* hoss_flags_t flags */
+		    arg->updctl,    /* hoss_update_t update_cond */
+		    arg->update,    /* hoss_update_t new_update */
+		    wbuf,           /* const void *writebuf */
+		    g,              /* struct hoss_grp *grp */
+		    nbytes_written, /* hoss_size_t *nbytes_wr */
+		    &urc            /* int *rc */
+		    );
+
+    if (rc)
+      break;
+
+    rc = hoss_end(g, 1);
+
+    if (urc)
+      return urc;
+    return rc;
+  } while(0);
+  (void)hoss_end(g, 0);
+
+  return rc;
+}
+
+__blocking int
+aemain(int argc, char **argv)
+{
+  char path[20];
+  void *buf;
+  int rc;
+  struct asgsvc svc;
+  WRITE1args arg;
+  hoss_size_t nbytes;
+
+  buf = NULL;
+  buf = malloc(NREC*RLEN);
+
+  if (buf == NULL) {
+    fprintf(stderr, "malloc\n");
+    return -1;
+  }
+
+  memset(path, 0, 20);
+  memset(buf, 0, NREC*RLEN);
+  strcpy(path, "store");
+
+  rc = aesop_sem_module_init();
+  if (rc) {
+    fprintf(stderr, "aesop_sem_module_init()\n");
+    return -1;
+  }
+
+  rc = aethread_init();
+  if (rc) {
+    fprintf(stderr, "aethread_init()\n");
+    return -1;
+  }
+
+  rc = aesop_timer_init();
+  if (rc) {
+    fprintf(stderr, "aesop_timer_init()\n");
+    return -1;
+  }
+
+  rc = hoss_init(&hoss, path);
+
+  if (rc) {
+    fprintf(stderr, "hoss_init\n");
+    return -1;
+  }
+
+  svc.hoss = hoss;
+  arg.nsid.container = 0;
+  arg.nsid.object = 0;
+  arg.nsid.fork = 0;
+  arg.at = 0;
+  arg.nrecs = NREC;
+  arg.rlen = RLEN;
+  arg.cond = 0;
+  arg.updctl = 0;
+  arg.update = 0;
+  arg.match = 0;
+  arg.ret = 0;
+  
+  rc = do_hoss_write(&arg, buf, &nbytes, &svc, NULL, 0);
+
+  free(buf);
+
+  if (rc) {
+    fprintf(stderr, "do_hoss_write: %d\n", rc);
+    return -1;
+  }
+
+  return 0;
+}
+
+aesop_main_set(aemain);

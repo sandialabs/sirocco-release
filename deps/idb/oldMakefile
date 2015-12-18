@@ -1,0 +1,74 @@
+AEBP=ae-blocking-parser
+AECC=aecc
+
+LDLIBS+=-ldb -lm
+CFLAGS+=-g -O0
+CFLAGS+=-Wall -Wextra -Wno-unused-label
+
+#for libdb types and my -std=c99
+CPPFLAGS+=-D_BSD_SOURCE -DDB_DBM_HSEARCH=0
+
+#OS detection
+ifeq ("$(shell uname -s)","Darwin")
+else
+	LDLIBS+=-lpthread -lrt
+endif
+
+
+#Detect whether warnings/other stuff are needed. For gcc-4.7.
+ifeq ("$(USE_EXCESSIVE_GCC_WARNINGS)","")
+	CFLAGS+=-Wno-unused-label -Wno-unused-parameter
+else
+	EXCESSIVE_GCC_WARNINGS+= -std=c99 -pedantic -Wformat=2		\
+	-Winit-self -Wmissing-include-dirs -Wswitch-default		\
+	-Wswitch-enum -Wunused -Wuninitialized -Wfloat-equal		\
+	-Wdeclaration-after-statement -Wundef -Wshadow			\
+	-Wpointer-arith -Wbad-function-cast -Wcast-qual -Wcast-align	\
+	-Wconversion -Wsign-conversion -Wlogical-op			\
+	-Wstrict-prototypes -Wold-style-definition			\
+	-Wmissing-field-initializers -Wmissing-declarations		\
+	-Wmissing-prototypes -Wredundant-decls -Wnested-externs		\
+	-Wstack-protector -fstack-protector -Wno-variadic-macros	\
+	-Wunused-label -Wno-unused-parameter
+endif
+
+%.o: %.ae
+	$(AECC) $< -o $@ -- -c $(CPPFLAGS) $(CFLAGS)
+
+all: idb idbtest aeidb ddlk
+
+idb: libidb.a
+
+ddlk: libidb.a
+
+aeidb: LDLIBS+= -laesop -lopa -lc-utils -lev
+aeidb: libaeidb.a
+
+idbtest: libidb.a
+
+libaeidb.a: libaeidb.a(idb_impl.o idb_static.o aeidb_once.o aeidb_impl.o)
+
+clean:
+	rm -f libidb.a libaeidb.a idb idbtest idb_impl.o idb_static.o idb_once.o idb.o aeidb
+	rm -rf idb.dSYM idbtest.dSYM
+
+# Certain targets are C-language only, so they can be built with much
+# more extensive warnings.
+idb.o: CFLAGS+=$(EXCESSIVE_GCC_WARNINGS)
+idb_impl.o: CFLAGS+=$(EXCESSIVE_GCC_WARNINGS)
+idb_static.o: CFLAGS+=$(EXCESSIVE_GCC_WARNINGS)
+idb_once.o: CFLAGS+=$(EXCESSIVE_GCC_WARNINGS)
+
+# Build a library without using any Aesop infrastructure, and thus not
+# defining any Aesop-dependent functions.
+libidb.a: libidb.a(idb_impl.o idb_static.o idb_once.o)
+
+# Rules to ensure that derived files are rebuilt when mixed files are updated
+aeidb.ae: idb.c
+	touch aeidb.ae
+
+aeidb_once.ae: idb_once.c
+	touch aeidb_once.ae
+
+aeidb_impl.ae: idb_impl.c
+	touch aeidb_impl.ae

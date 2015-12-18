@@ -1,0 +1,15 @@
+./prepare.sh
+./configure
+make
+make install
+
+Thanks to Argonne, as their examples form the bulk of autotools
+support here.
+
+Known issues:
+- CPPFLAGS does not work. Use CFLAGS instead.
+- You will get warnings from system headers, notably those from
+  -Wmissing-prototypes.
+- Everything in this package will compile with -D_BSD_SOURCE and
+  -DDB_DBM_HSEARCH=0. The AESOP compile rules don't listen to
+  -per-target flags.

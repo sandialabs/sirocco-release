@@ -1,0 +1,180 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <aesop/aesop.h>
+#include <hoss.hae>
+#include "aatree.hae"
+
+#define NUMTESTS 10000
+
+__blocking int ae_main(int argc, char **argv) {
+	struct aatree a;
+	int insertion[NUMTESTS], 
+		deletion[NUMTESTS], 
+		rdlock[NUMTESTS],
+		wrlockfail[NUMTESTS],
+		wrlocksuc[NUMTESTS],
+		rlock_release[NUMTESTS];
+	pthread_rwlock_t lock[NUMTESTS],
+		*lockt;
+	uint64_t i, j, k;
+	struct hoss_oid keys[NUMTESTS];
+
+	srand((uint32_t)time(0));
+
+	for (i = 0; i < NUMTESTS; i++) {
+		keys[i].nids = 3;
+		keys[i].ids = NULL;
+		keys[i].ids = malloc(sizeof(hoss_eid_t)*keys[i].nids);
+		if (keys[i].ids == NULL) {
+			printf("no memory\n");
+			return -1;
+		}
+	}
+
+	for (i = 0; i < NUMTESTS/2; i++) {
+		for (j = 0; j < 3; j++) {
+			keys[i].ids[j] = (hoss_eid_t)rand();
+		}
+	}
+
+	for (i = NUMTESTS/2; i < NUMTESTS; i++) {
+		for (j = 0; j < 3; j++) {
+			keys[i].ids[j] = keys[i - (NUMTESTS/2)].ids[j];
+		}
+	}
+
+	aa_init_tree(&a);
+
+	for (i = 0; i < NUMTESTS; i++) {
+		pthread_rwlock_init(&lock[i], NULL);
+		insertion[i] = aa_insert(&a, keys[i], &lock[i]);
+		/* seize read lock */
+		lockt = aa_find(&a, keys[i]);
+		int rc = pthread_rwlock_rdlock(lockt);
+		rdlock[i] = 0;
+		if (rc == 0) 
+			rdlock[i] = 1;
+		/* attempt to seize write lock */
+		rc = pthread_rwlock_trywrlock(lockt);
+		if (rc != 0) {
+			wrlockfail[i] = 1;
+		}
+	}
+
+	for (i = 0; i < NUMTESTS; i++) {
+		/* release read lock */
+		rlock_release[i] = 0;
+		lockt = aa_find(&a, keys[i]);
+		int rc = pthread_rwlock_unlock(lockt);
+		if (rc == 0)
+			rlock_release[i] = 1;		
+	}
+
+	for (i = 0; i < NUMTESTS/2; i++) {
+		wrlocksuc[i] = 0;
+		lockt = aa_find(&a, keys[i]);
+		int rc = pthread_rwlock_wrlock(lockt);
+		if (rc == 0)
+			wrlocksuc[i] = 1;
+	}
+
+	for (i = 0; i < NUMTESTS; i++) {
+		deletion[i] = -1;
+		lockt = aa_delete(&a, keys[i]);
+		if (lockt != NULL)
+			deletion[i] = 0;
+	}
+
+	printf("insertion status\n");
+	j = 0;
+	for (i = 0; i < NUMTESTS/2; i++) {
+		if (insertion[i] == 0)
+			j++;
+		else {
+			printf("%lu, %lu, %lu, index %lu failed\n", 
+			       keys[i].ids[0],
+			       keys[i].ids[1],
+			       keys[i].ids[2],
+			       i);
+			if (aa_find(&a, keys[i]))
+				printf("duplicate in tree\n");
+		}
+	}
+	k = 0;
+	for (i = NUMTESTS/2; i < NUMTESTS; i++) {
+		if (insertion[i] == -1)
+			k++;
+	}
+
+	if (j == NUMTESTS/2)
+		printf("all insertions expected to succeed, succeeded\n");
+	else
+		printf("not all insertions expected to succeed, succeeded.\n");
+	if (k == NUMTESTS/2)
+		printf("all insertions expected to fail, failed\n");
+	else
+		printf("not all insertions expected to fail, failed\n");
+
+	printf("deletion status\n");
+	j = 0;
+	for (i = 0; i < NUMTESTS/2; i++) {
+		if (deletion[i] == 0) 
+			j++;
+	}
+	k = 0;
+	for (i = NUMTESTS/2; i < NUMTESTS; i++) {
+		if (deletion[i] == -1)
+			k++;
+	}
+
+	if (j == NUMTESTS/2)
+		printf("all deletions expected to succeed, succeeded\n");
+	else
+		printf("not all deletions expected to succeed, succeeded.\n");
+	if (k == NUMTESTS/2)
+		printf("all deletions expected to fail, failed\n");
+	else
+		printf("not all deletions expected to fail, failed\n");
+
+
+	printf("lock status\n");
+	j = 0;
+	k = 0;
+	for (i = 0; i < NUMTESTS; i++) {
+		/* check read locks */
+		if (rdlock[i] == 1)
+			j++;
+		/* check write lock failures */
+		if (wrlockfail[i] == 1)
+			k++;
+	}
+
+	if (j == NUMTESTS)
+		printf("all read locks succeeded\n");
+	else
+		printf("not all read locks succeeded\n");
+
+	if (k == NUMTESTS)
+		printf("all write locks expected to fail, failed\n");
+	else
+		printf("Not all write locks expected to fail, failed\n");
+
+	j = 0;
+	for (i = 0; i < NUMTESTS/2; i++) {
+		if (wrlocksuc[i] == 1)
+			j++;
+	}
+
+	if (j == NUMTESTS/2) 
+		printf("all write locks expected to succeed, succeeded\n");
+	else
+		printf("Not all write locks expected to succeed, succeeded. %lu of %d failed\n", NUMTESTS/2-j, NUMTESTS/2);
+
+	aa_destroy_tree(&a);
+	for (i = 0; i < NUMTESTS; i++) {
+		free(keys[i].ids);
+	}
+	return 0;
+}
+
+aesop_main_set(ae_main);

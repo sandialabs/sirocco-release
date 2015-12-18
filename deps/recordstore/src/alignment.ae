@@ -1,0 +1,127 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#include <stdint.h>
+#include <aesop/aesop.h>
+#include <aesop/aefile.hae>
+#include "alignment.hae"
+
+__blocking int align_write(int fd, const void *buf, size_t count, off_t offset, int alignment)
+{
+    size_t aligned_count = 0;
+    void* aligned_buf = NULL;
+    ssize_t wret;
+    int ret;
+
+    /* NOTE: writes should always be aligned on disk for now; the
+     * recordstore only allows writes to aligned log offsets.  If this
+     * changes in the future then we have to add locking of some sort to
+     * pootect concurrent writes to the same page.
+     */
+    assert(offset % alignment == 0);
+
+    if(((unsigned long)buf)%alignment || count%alignment)
+    {
+        aligned_count = ((count/alignment)+1)*alignment;
+
+        /* memory is not fully aligned (either in ptr or count) */
+        /* use intermediate buffer */
+        ret = posix_memalign(&aligned_buf, alignment, aligned_count);
+        if(ret != 0)
+        {
+            return(-ret);
+        }
+        memcpy(aligned_buf, buf, count);
+    }
+    else
+    {
+        aligned_buf = buf;
+        aligned_count = count;
+    }
+
+    wret = aefile_pwrite(fd, aligned_buf, aligned_count, offset);
+    if(wret < 0)
+    {
+        if(aligned_buf != buf)
+            free(aligned_buf);
+        return(wret);
+    }
+    
+    /* Handling short writes when you are trying to do aligned I/O could be
+     * tricky
+     */
+    assert(wret == aligned_count);
+
+    if(aligned_buf != buf)
+        free(aligned_buf);
+    return(0);
+}
+
+__blocking int align_read(int fd, void *buf, size_t count, off_t offset, int alignment)
+{
+    ssize_t rret;
+    int ret;
+    size_t aligned_count = 0;
+    void* aligned_buf = NULL;
+    off_t aligned_offset = 0;
+
+    if(((unsigned long)buf) % alignment == 0 &&
+        offset % alignment == 0 &&
+        count % alignment == 0)
+    {
+        /* perfect alignment; just read and return */
+        rret = aefile_pread(fd, buf, count, offset);
+        if(rret < 0)
+        {
+            return(rret);
+        }
+        /* short reads with alignment are tricky to handle */
+        assert(rret == count);
+        return(0);
+    }
+
+    /* if we fall through to this point then alignment is off and we will
+     * need to use a scratch buffer
+     */
+
+    /* round down offset */
+    aligned_offset = offset/alignment * alignment;
+    /* expand size to account for rounding down */
+    aligned_count = count + (offset-aligned_offset);
+    /* round up size */
+    if(aligned_count % alignment)
+        aligned_count =(aligned_count/alignment + 1) * alignment;
+
+    /* allocate scratch buffer */
+    ret = posix_memalign(&aligned_buf, alignment, aligned_count);
+    if(ret != 0)
+    {
+        return(-ret);
+    }
+
+    /* read into scratch buffer */
+    rret = aefile_pread(fd, aligned_buf, aligned_count, aligned_offset);
+    if(rret < 0)
+    {
+        return(rret);
+    }
+    /* short reads with alignment are tricky to handle */
+    assert(rret == aligned_count);
+
+    /* copy out data */
+    memcpy(buf, (void*)(((unsigned long)aligned_buf)+(offset-aligned_offset)), 
+        count);
+    return(0);
+}
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

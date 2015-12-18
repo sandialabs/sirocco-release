@@ -1,0 +1,50 @@
+testlib = src/libhoss.la
+
+check_PROGRAMS +=		\
+ tests/cond		\
+ tests/simple_grp		\
+ tests/simple_nested_grp	\
+ tests/simple_deferred_grp	\
+ tests/write_read		\
+ tests/hosstest			\
+ tests/hoss-concurrent-io	\
+ tests/probe			\
+ tests/cond_all
+
+TESTS +=
+
+tests_hosstest_LDADD = $(testlib) -lev -lpthread
+tests_hosstest_SOURCES = tests/hosstest.ae
+AE_SRC += tests/hosstest.ae
+
+tests_simple_grp_LDADD = $(testlib) -lev -lpthread
+tests_simple_grp_SOURCES = tests/simple_grp.ae
+AE_SRC += tests/simple_grp.ae
+
+tests_simple_deferred_grp_LDADD = $(testlib) -lev -lpthread
+tests_simple_deferred_grp_SOURCES = tests/simple_deferred_grp.ae
+AE_SRC += tests/simple_deferred_grp.ae
+
+tests_simple_nested_grp_LDADD = $(testlib) -lev -lpthread
+tests_simple_nested_grp_SOURCES = tests/simple_nested_grp.ae
+AE_SRC += tests/simple_nested_grp.ae
+
+tests_write_read_LDADD = $(testlib) -lev -lpthread
+tests_write_read_SOURCES = tests/write_read.ae
+AE_SRC += tests/write_read.ae
+
+tests_hoss_concurrent_io_LDADD = $(testlib) -lev -lpthread
+tests_hoss_concurrent_io_SOURCES = tests/hoss-concurrent-io.ae
+AE_SRC += tests/hoss-concurrent-io.ae
+
+tests_probe_LDADD = $(testlib) -lev -lpthread
+tests_probe_SOURCES = tests/probe.ae tests/test_util.ae
+AE_SRC += tests/probe.ae
+
+tests_cond_LDADD = $(testlib) -lev -lpthread
+tests_cond_SOURCES = tests/cond.ae tests/test_util.ae
+AE_SRC += tests/cond.ae
+
+tests_cond_all_LDADD = $(testlib) -lev -lpthread
+tests_cond_all_SOURCES = tests/cond_all.ae
+AE_SRC += tests/cond_all.ae

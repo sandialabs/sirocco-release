@@ -1,0 +1,129 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+#include <errno.h>
+#include <idb.h>
+
+#include "internal.hae"
+
+rs_key_t
+_hoss_oid_to_key(struct hoss_oid *oid)
+{
+	/* Mapping from ID to key should be resistant to colliding
+	 * with heavy use of lower-level object space. Here's the
+	 * scheme:
+	 *
+	 * Copy last OIDs int key so that there won't be collisions
+	 * within a containing object (e.g., 0,...,0,1 will not
+	 * collide with 0,...,0,2, but 1,0,...,0,1 may collide with
+	 * 0,...,0,1).
+	 *
+	 * Additionally, first ID is depth, so 0 won't collide with
+	 * 0,0 or 0,0,0, etc, for limited depths. Allows uniqueness to
+	 * the point that the known users are needing, and lets us
+	 * steal a few bits later if required.
+	 */
+
+	rs_key_t key;
+	size_t neids = sizeof(rs_key_t) / sizeof(hoss_eid_t);
+	size_t ids_to_copy;
+
+	memset(&key, '\0', sizeof(key));
+	/* oid->ids = 1 */
+	((hoss_eid_t *)(&key))[0] = oid->nids;
+	if (oid->nids < (neids - 1))
+		ids_to_copy = oid->nids;
+	else
+		ids_to_copy = neids - 1;
+
+	memcpy(((hoss_eid_t *)(&key)) + 1,
+	       oid->ids + oid->nids - ids_to_copy,
+	       sizeof(hoss_eid_t) * ids_to_copy);
+
+	return key;
+}
+
+/* Converts an OID to a character string representation. Returns size
+ * required, including NULL terminator
+ */
+size_t
+_hoss_oid_to_ch(struct hoss_oid *id, char *dst, size_t sz)
+{
+        size_t bufsize, i, end;
+        int rc;
+
+        bufsize = 2 /* 0x */ +
+		(sizeof(id->ids[0]) * 2) * id->nids /* Each ID in hex */ +
+		1 /* \0 */;
+        if (sz >= bufsize) {
+                end = 0;
+		rc = sprintf(dst + end, "0x");
+		assert(rc == 2);
+		end += rc;
+                for (i = 0; i < id->nids; i++) {
+                        rc = sprintf(dst + end, "%.16" OIDFMT "x",
+                                     id->ids[i]);
+                        assert(rc == 16);
+                        end += (size_t)rc;
+                }
+		dst[end++] = '\0';
+		assert(end == bufsize);
+        }
+        return bufsize;
+}
+
+int
+_hoss_alloc_oid_to_ch(struct hoss_oid *id, char **dst)
+{
+	size_t idsz;
+
+	idsz = _hoss_oid_to_ch(id, NULL, 0);
+	*dst = malloc(idsz);
+	if (id == NULL)
+		return errno;
+	if (_hoss_oid_to_ch(id, *dst, idsz) != idsz) {
+		return EFAULT;
+	}
+	return 0;
+}
+
+int
+_hoss_is_in_range(struct idb_interval *iv)
+{
+	int rc = 1;
+#if (HOSS_OFF_MIN != IDB_OFF_MIN)
+	if (iv->rec < HOSS_OFF_MIN) {
+		SWARN("iv->rec (%lu) < HOSS_OFF_MIN (%lu)\n",
+		     iv->rec, HOSS_OFF_MIN);
+		rc = 0;
+	}
+#endif
+	if (iv->size <= 0) {
+		SWARN("iv->size (%lu) <= 0\n", iv->size);
+		rc = 0;
+	}
+	/* Refactored from iv->rec + iv->size - 1 > HOSS_OFF_MAX, to
+	   prevent overflow. size is positive/nonzero. */
+	if (iv->size - 1 > HOSS_OFF_MAX - iv->rec) {
+		SWARN("iv->size - 1 (%lu) > HOSS_OFF_MAX (%lu) - iv->rec "
+		      "(%lu)\n", iv->size - 1, HOSS_OFF_MAX, iv->rec);
+		SWARN("Should be congrunet to iv->rec (%lu) + iv->size (%lu) "
+		      "- 1 > HOSS_OFF_MAX (%lu)\n", iv->rec, iv->size,
+		      HOSS_OFF_MAX);
+		rc = 0;
+	}
+#if (HOSS_UPDATE_MIN != IDB_VERS_MIN)
+	if (iv->vers < HOSS_UPDATE_MIN) {
+		SWARN("iv->vers (%lu) < HOSS_UPDATE_MIN (%lu)\n",
+		      iv->vers, HOSS_UPDATE_MIN);
+		rc = 0;
+	}
+#endif
+#if (HOSS_UPDATE_MAX != IDB_VERS_MAX)
+	if (iv->vers > HOSS_UPDATE_MAX) {
+		SWARN("iv->vers (%lu) > HOSS_UPDATE_MAX (%lu)\n",
+		      iv->vers, HOSS_UPDATE_MAX);
+		rc = 0;
+	}
+#endif
+	return rc;
+}

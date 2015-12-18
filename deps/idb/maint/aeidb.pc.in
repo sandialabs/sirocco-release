@@ -1,0 +1,11 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: aeidb
+Description: An AESOP implementation of an interval database.
+Version: 0.2
+Requires: aesop c-utils
+Libs: -L${libdir} -laeidb -ldb
+Cflags: -I${includedir}

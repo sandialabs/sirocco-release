@@ -1,0 +1,33 @@
+AM_CFLAGS += -D_BSD_SOURCE -DDB_DBM_HSEARCH=0
+
+src_libidb_la_SOURCES += \
+ src/idb_impl.c \
+ src/idb_static.c \
+ src/idb_once.c
+
+src_libaeidb_la_SOURCES += \
+ src/idb_impl.c \
+ src/idb_static.c \
+ src/aeidb_once.ae \
+ src/aeidb_impl.ae
+
+AE_SRC += \
+ src/aeidb_once.ae \
+ src/aeidb_impl.ae
+
+AE_HDR += include/aeidb.hae
+
+MOSTLYCLEANFILES += \
+	src/aeidb_once.ae \
+	src/aeidb_impl.ae
+
+BUILT_SOURCES += \
+	src/aeidb_once.ae \
+	src/aeidb_impl.ae
+
+# Update timestamps for derived aesop files
+src/aeidb_once.ae: src/c_to_ae.c src/idb_once.c
+	cat $^ > $@
+
+src/aeidb_impl.ae: src/c_to_ae.c src/idb_impl.c
+	cat $^ > $@

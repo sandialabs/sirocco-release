@@ -1,0 +1,325 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#include <fcntl.h>
+#include <stdint.h>
+#include <errno.h>
+
+#include <triton-list.h>
+#include <aesop/aesop.h>
+#include <aesop/sem.hae>
+#include <aesop/aefile.hae>
+
+#include "sync-mgr.hae"
+
+/* Maximum number of distinct file descriptors that we will track per group
+ * to coalesce.  Beyond this point we will fall back to syncfs().
+ */
+#define MAX_COAL_FD 16
+
+/* group of file descriptors to by sync'd together */
+struct sync_group
+{
+    struct sync_mgr_instance* smi;
+    int started_count;
+    int ended_count;
+    int synced_count;
+    int fds_to_sync[MAX_COAL_FD];
+    int fds_to_sync_count;
+    int syncfs_flag;
+    aesop_sem_t sem;
+};
+
+/* sync mgr instance (multiple may be active at once for different storage
+ * devices) 
+ */
+struct sync_mgr_instance
+{
+    int sync_highwater;
+    int open_flags;
+    struct sync_group* current_sync_group;
+    pthread_mutex_t current_sync_group_mutex;
+};
+
+static struct sync_group* alloc_sync_group(struct sync_mgr_instance* smi);
+static void free_sync_group(struct sync_group* sg);
+static __blocking int sync_sync_group(struct sync_group* sg);
+
+struct sync_mgr_instance* sync_mgr_initialize(
+    int sync_highwater,
+    int open_flags)
+{
+    struct sync_mgr_instance* smi;
+    int ret;
+
+    ret = aesop_sem_module_init();
+    if(ret != AE_SUCCESS)
+    {
+        return(NULL);
+    }
+
+    smi = malloc(sizeof(*smi));
+    if(!smi)
+    {
+        aesop_sem_module_finalize();
+        return(NULL);
+    }
+
+    smi->current_sync_group = alloc_sync_group(smi);
+    if(!smi->current_sync_group)
+    {
+        free(smi);
+        aesop_sem_module_finalize();
+        return(NULL);
+    }
+
+    smi->sync_highwater = sync_highwater;
+    smi->open_flags = open_flags;
+    pthread_mutex_init(&smi->current_sync_group_mutex, NULL);
+
+    return(smi);
+}
+
+void sync_mgr_finalize(struct sync_mgr_instance* smi)
+{
+    free_sync_group(smi->current_sync_group);
+    triton_mutex_destroy(&smi->current_sync_group_mutex);
+    free(smi);
+    aesop_sem_module_finalize();
+    return;
+}
+
+struct sync_group* sync_mgr_start_write(struct sync_mgr_instance* smi, int fd)
+{
+    struct sync_group* sg;
+    int already_tracked = 0;
+    int i;
+
+    if(smi->open_flags & O_SYNC && smi->sync_highwater < 2)
+    {
+        /* implicit syncing is enabled without coalescing.  Nothing for us
+         * to do here; each individual write will automatically by sync'd.
+         */
+        return(NULL);
+    }
+
+    pthread_mutex_lock(&smi->current_sync_group_mutex);
+    
+    /* add on to current sync group */
+    sg = smi->current_sync_group;
+
+    if(sg->fds_to_sync_count == MAX_COAL_FD || sg->syncfs_flag)
+    {
+        /* already tracking too many disinct fds; switch to syncfs mode */
+        sg->fds_to_sync_count = 0;
+        sg->syncfs_flag = 1;
+    }
+    else
+    {
+        /* is this fd already being tracked? */
+        for(i=0; i<sg->fds_to_sync_count; i++)
+        {
+            if(sg->fds_to_sync[i] == fd)
+            {
+                already_tracked = 1;
+                break;
+            }
+        }
+
+        /* add our fd */
+        if(!already_tracked)
+        {
+            sg->fds_to_sync[sg->fds_to_sync_count] = fd;
+            sg->fds_to_sync_count++;
+        }
+    }
+
+    /* increment ops being tracked in this group (which may be higher than
+     * the number of fds being tracked)
+     */
+    sg->started_count++;
+
+    /* check highwater mark */
+    if(sg->started_count >= smi->sync_highwater)
+    {
+        /* this group is full; start a new sync group for the next write to
+         * use
+         */
+        smi->current_sync_group = alloc_sync_group(smi);
+        assert(smi->current_sync_group);
+    }
+
+    pthread_mutex_unlock(&smi->current_sync_group_mutex);
+
+    return(sg);
+}
+
+__blocking int sync_mgr_end_write(struct sync_mgr_instance* smi, struct sync_group* sg)
+{
+    int do_sync_flag = 0;
+    int do_exit_flag = 0;
+    int ret;
+    int i;
+
+    if(!sg)
+    {
+        /* coalescing disabled */
+        return(0);
+    }
+
+    if(!(smi->open_flags & O_SYNC))
+    {
+        /* implicit syncing is not enabled either; we don't do anything
+         * unless the caller uses the rs_flush() function.
+         */
+        return(0);
+    }
+
+    pthread_mutex_lock(&smi->current_sync_group_mutex);
+
+    sg->ended_count++;
+    if(sg->started_count == sg->ended_count)
+    {
+        /* I/O for group is complete; we need to sync */
+        if(sg == smi->current_sync_group)
+        {
+            /* this is still the active sync group; swap it out */
+            smi->current_sync_group = alloc_sync_group(smi);
+            assert(smi->current_sync_group);
+        }
+        do_sync_flag = 1;
+    }
+
+    pthread_mutex_unlock(&smi->current_sync_group_mutex);
+    
+    if(!do_sync_flag)
+    {
+        /* someone else will handle the sync; we sleep */
+        ret = aesop_sem_down(&sg->sem);
+        if(ret != AE_SUCCESS)
+            return(ret);
+    }
+    else
+    {
+        /* we are the designated syncer for the group */
+        ret = sync_sync_group(sg);
+        if(ret < 0)
+            return(ret);
+
+        /* notify other members of group */
+        for(i=0; i<(sg->ended_count-1); i++)
+        {
+            ret = aesop_sem_up(&sg->sem);
+            if(ret != AE_SUCCESS)
+                return(ret);
+        }
+    }
+
+    /* At this point we are exiting the group but we don't know the order.
+     * Increment a counter so that we can identify the last group
+     * participant to clean up.
+     */
+    pthread_mutex_lock(&smi->current_sync_group_mutex);
+    sg->synced_count++;
+    if(sg->synced_count == sg->ended_count)
+        do_exit_flag = 1;
+    pthread_mutex_unlock(&smi->current_sync_group_mutex);
+    
+    if(do_exit_flag)
+        free_sync_group(sg);
+
+    return(0);
+}
+
+__blocking int sync_mgr_flush_all(struct sync_mgr_instance* smi)
+{
+    struct sync_group* sg;
+    int ret;
+
+    /* this logic will get confusing in a hurry if used in conjunction with
+     * O_SYNC; disallow for now.
+     */
+    assert(!(smi->open_flags && O_SYNC));
+
+    pthread_mutex_lock(&smi->current_sync_group_mutex);
+
+    /* replace current sync group */
+    sg = smi->current_sync_group;
+    smi->current_sync_group = alloc_sync_group(smi);
+    assert(smi->current_sync_group);
+    
+    pthread_mutex_unlock(&smi->current_sync_group_mutex);
+
+    ret = sync_sync_group(sg);
+
+    free_sync_group(sg);
+
+    return(ret);
+}
+
+static struct sync_group* alloc_sync_group(struct sync_mgr_instance* smi)
+{
+    struct sync_group* sg;
+    int ret;
+
+    sg = malloc(sizeof(*sg));
+    if(!sg)
+        return(NULL);
+    memset(sg, 0, sizeof(*sg));
+    
+    sg->smi = smi;
+    ret = aesop_sem_init(&sg->sem, 0);
+    if(ret != AE_SUCCESS)
+    {
+        free(sg);
+        return(NULL);
+    }
+
+    return(sg);
+}
+
+static void free_sync_group(struct sync_group* sg)
+{
+    aesop_sem_destroy(&sg->sem);
+    free(sg);
+}
+
+static __blocking int sync_sync_group(struct sync_group* sg)
+{
+    int ret;
+    int i;
+
+    if(sg->syncfs_flag)
+    {
+        ret = aefile_syncfs(sg->fds_to_sync[0]);
+        if(ret < 0)
+        {
+            return(-errno);
+        }
+    }
+    else
+    {
+        for(i=0; i<sg->fds_to_sync_count; i++)
+        {
+            ret = aefile_fdatasync(sg->fds_to_sync[i]);
+            if(ret < 0)
+            {
+                return(-errno);
+            }
+        }
+    }
+
+    return(0);
+}
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

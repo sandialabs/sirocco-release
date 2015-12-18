@@ -1,0 +1,188 @@
+#ifndef __HOSS_HAE__
+#define __HOSS_HAE__
+
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <errno.h>
+#include <idb.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include <sys/queue.h>
+
+typedef unsigned hoss_flags_t;
+
+typedef uint64_t hoss_eid_t;
+/* Different operating systems use different formats for uint64_t. */
+#ifdef HOSS_LL_OID
+#define OIDFMT "ll"
+#else
+#define OIDFMT "l"
+#endif
+
+typedef int64_t  hoss_off_t;
+typedef uint64_t hoss_size_t;
+typedef uint64_t hoss_update_t;
+
+#define HOSS_OFF_MIN 0
+#define HOSS_OFF_MAX INT64_MAX
+
+#define HOSS_SIZE_MIN 0
+#define HOSS_SIZE_MAX INT64_MAX
+
+#define HOSS_UPDATE_MIN 0
+#define HOSS_UPDATE_MAX (UINT64_MAX-1)
+#define HOSS_UPDATE_MIXED UINT64_MAX
+#define HOSS_UPDATE_INVALID 0
+
+/* Error codes */
+#define HOSS_ECONDFAIL ENOTEMPTY /* COND_ALL failed. */
+
+struct hoss_ctx;
+struct hoss_grp;
+
+struct hoss_oid {
+	size_t nids;
+	hoss_eid_t *ids;
+};
+
+/* Can return postive errno, or negative aesop error as defined in
+   ae-error.h */
+int hoss_init(struct hoss_ctx **_hoss, const char *_path);
+
+/* An init interface that allows passing in user-configured record
+ * stores and IDB contexts. The user is not allowed to use the IDB or
+ * RS after calling this function, and they will be closed at
+ * hoss_fini. */
+struct rs_instance;
+int hoss_init_config(struct hoss_ctx **_hoss, struct rs_instance *rs,
+		    struct _idb_context *idbc);
+
+void hoss_fini(struct hoss_ctx *hoss);
+
+
+/* Group flags */
+#define HOSS_NONE    (0)      /* Default. A failure in the group does
+			        not affect the outcome of other
+			        operations. If the underlying storage
+			        is configured for it, write-back
+			        caching is used. Flags below modify
+			        this behavior. */
+#define HOSS_MSYNC   (1 << 0) /* All modifications within the group are
+			      * performed transactionally. Any failure
+			      * of an operation within the group
+			      * results in discarding any changes made
+			      * within the group. Inherited by
+			      * subgroups. */
+#define HOSS_ORDERED (1 << 1) /* When a write operation completes
+			      * successfully (at operation time
+			      * without HOSS_MSYNC or at hoss_end with
+			      * HOSS_MSYNC), written data is
+			      * persistent. */
+#define HOSS_SHORT   (1 << 2) /* Upon encountering write error,
+				write processing stops. This is not
+				considered a failure in the group. NOT
+				inherited by subgroups. */
+#define HOSS_DEFERRED (1 << 3)/* Execution of the operation is deferred
+			      * until the group is ended. Inherited by
+			      * subgroups. */
+#define HOSS_SPARSE (1 << 4)  /* A read region may include holes, which
+			      * are packed densely into the target
+			      * buffer. NOT inherited by subgroups. */
+#define HOSS_GRP_FLAG_MASK ((1 << 5)-1)
+
+/* Conditional flags */
+#define HOSS_COND_ALL (1 << 5) /* All versions covered by this region
+				  must be strictly less than the
+				  update_condition parameter for this
+				  operaiton to succeed. */
+#define HOSS_AUTO_INC (1 << 6) /* The version number of the covered
+				  region will be the maximum already
+				  present plus the value of
+				  new_update. Fails with ECONDFAIL if
+				  too large. */
+
+__blocking int hoss_begin(struct hoss_grp **child, struct hoss_grp *parent,
+			 hoss_flags_t flags, struct hoss_ctx *hoss);
+
+/* End a group. Note that passing 0 for commit will only have an
+   effect if the group was started with HOSS_MSYNC. */
+__blocking int hoss_end(struct hoss_grp *grp, unsigned commit);
+
+/* Parameters:
+ *
+ * - oid: Object ID to write to
+ * - start: First record to write
+ * - nrecs: Number of records to write
+ * - reclen: Size of each record being written
+ * - flags: Flags to alter write behavior (e.g., conditionals)
+ * - update_condition: Update ID to use in conditional operations
+ * - new_update: Update ID to use when writing records
+ * - buf: Buffer to write records from
+ * - grp: HOSS group within which write is performed
+ * - nbytes_written: [out] Number of bytes read from writebuf
+ * - rc: [out] Return code for write operation, populated at I/O time (which
+ *       is dependent on group flags). EINPROGRESS until operation is
+ *       complete.
+ *
+ * Return value: Non-I/O based return value. Either 0 or ENOMEM.
+ */
+__blocking int
+hoss_write(struct hoss_oid *oid,
+          hoss_off_t start,
+          hoss_size_t nrecs,
+          hoss_size_t reclen,
+          hoss_flags_t flags,
+          hoss_update_t update_condition,
+          hoss_update_t new_update,
+          const void *writebuf,
+          struct hoss_grp *grp,
+          hoss_size_t *nbytes_written,
+	  int *rc);
+
+struct hoss_record_info {
+	hoss_off_t start;
+	hoss_size_t nrecs;
+	hoss_size_t reclen;
+	hoss_update_t update_id;
+};
+
+/* Parameters:
+ *
+ * - oid: Object ID to read from
+ * - start: First record to read
+ * - nrecs: Number of records to read
+ * - flags: Flags to alter read behavior (e.g., conditionals)
+ * - update_condition: Update ID to use in conditional operations
+ * - buf: Buffer to read records into
+ * - bufsize: Number of bytes in buf
+ * - ribuf: Buffer to read probe entries into
+ * - maxris: Number of probe entries in ribuf
+ * - grp: HOSS group within which read is performed
+ * - nbytes_read: [out] Number of bytes deposited in buf
+ * - nris: [out] Number of probe records deposited in ribuf
+ * - update_info: [out] Version data. Currently an aggregation of probe data,
+ *                could consider a read-centric interpretation.
+ * - rc: [out] Return code for read operation, populated at I/O time (which is
+ *       dependent on group flags). EINPROGRESS until operation is complete.
+ *
+ * Return value: Non-I/O based return value. Either 0 or ENOMEM.
+ */
+__blocking int
+hoss_read(struct hoss_oid *oid,
+	 hoss_off_t start,
+	 hoss_size_t nrecs,
+	 hoss_flags_t flags,
+	 hoss_update_t update_condition,
+	 void *buf,
+	 hoss_size_t bufsize,
+	 struct hoss_record_info *ribuf,
+	 hoss_size_t maxris,
+	 struct hoss_grp *grp,
+	 hoss_size_t *nbytes_read,
+	 hoss_size_t *nris,
+	 hoss_update_t *update_info,
+	 int *rc);
+
+#endif

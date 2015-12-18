@@ -1,0 +1,12 @@
+#ifndef _SIGNAL_SHUTDOWN_H_
+#define _SIGNAL_SHUTDOWN_H_
+
+extern int signal_shutdown;
+
+int signal_shutdown_init(void);
+int signal_shutdown_fini(void);
+__blocking int signal_shutdown_wait(void);
+
+#define signal_shutdown_signaled() ((const int)(signal_shutdown))
+
+#endif

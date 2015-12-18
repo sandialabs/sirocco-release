@@ -1,0 +1,56 @@
+MIXING AESOP AND PLAIN C
+---
+
+This codebase mixes Aesop and non-Aesop functionality in the same
+files (called mixed), so that defining USE_AESOP will cause the file
+to use Aesop constructs (and, for global functions, possibly generate
+a different name). Mixed files are compiled directly to .o files
+without USE_AESOP defined, while other files (called derived) will
+define USE_AESOP and include the mixed file. The derived files are:
+
+- aeidb_once.ae includes idb_once.c
+- aeidb.ae includes idb.c
+- aeidb_impl.ae include idb_impl.c
+
+The Makefile includes rules that touch the derived files whenever the
+mixed files are updates, so that updates to the mixed files will cause
+a rebuild of the derived files.
+
+Files *_once includes functions that should only be included in a
+library one time. *_impl includes functions that are named differently
+based on whether they use aesop, so they can be included in each
+library.
+
+CROSS PLATFORM/MULTIPLE COMPILERS
+---
+This software should build on llvm under OS X 10.9 as well as under
+GCC under Linux. There is rudimentary detection of platform in the
+Makefile, and it's straightforward to tell if this breaks for
+Linux. However, for OS X, linking can break with complaints of a
+missing crt0.o. Be forewarned.
+
+FILE ORGANIZATION
+---
+IDB is a small piece of software, but is split across a few files for
+compilation purposes.
+
+- idb_once.c: Defines functions that should only be compiled
+  differently for as Aesop and non-Aesop, but would have the same
+  name, so only one version should go in the library. For example,
+  idb_init will initialize Aesop resources if compiled for Aesop.
+- idb_impl.c: Defines functions that may compile differently for Aesop
+  and non-Aesop, which will also be named differently. For example,
+  idb_insert and aeidb_insert are the same function in this file.
+- idb_static.c: Defines storage for static variables used by the
+  library.
+
+VALGRIND
+---
+There is some additional check support for Valgrind if you define
+USE_VALGRIND. This requires memcheck.h and valgrind.h.
+
+LIBDB
+---
+There is crude detection in the source about whether Berkeley DB
+version 6 is being used, as a callback signature for the btree
+comparator changes.

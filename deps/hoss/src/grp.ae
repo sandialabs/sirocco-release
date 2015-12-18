@@ -1,0 +1,235 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <errno.h>
+
+#include <aeidb.hae>
+#include <sys/queue.h>
+
+#include "idb_cache.h"
+#include "internal.hae"
+
+__blocking IDBX
+_hoss_idbx_get(struct hoss_grp *g)
+{
+	if (g->idbx == NULL) {
+		if (g->my_tx) {
+			g->idbx = aeidb_begin(g->hoss->idbc);
+		} else {
+			g->idbx = _hoss_idbx_get(g->parent);
+		}
+	}
+	return g->idbx;
+}
+
+__blocking int
+_hoss_idbx_put(struct hoss_grp *g, int flags)
+{
+	int rc;
+
+	if (g->idbx == NULL)
+		return 0;
+
+	/* Any reason to pile things in the transaction, go ahead */
+	rc = 0;
+	if (g->my_tx && ((g->flags & HOSS_MSYNC) == 0 ||
+			 (flags & END_OF_GRP))) {
+		/* Just close it */
+		rc = aeidb_end(g->idbx, (flags & COMMIT) ? 1 : 0);
+		g->idbx = NULL;
+	}
+	return rc;
+}
+
+static int
+inherit_init(struct hoss_grp *c, hoss_flags_t f, struct hoss_grp *p,
+	     struct hoss_ctx *hoss)
+{
+	c->hoss = hoss;
+	c->idbx = NULL;
+	c->flags = f;
+	c->parent = p;
+	c->status = 0;
+	TAILQ_INIT(&c->deferred_ops);
+
+	if (p == NULL) {
+		c->my_tx = 1;
+		c->dbs = hoss_idb_cache_create();
+		if (c->dbs == NULL)
+			return ENOMEM;
+		return 0;
+	}
+
+	/* Parent is non-NULL */
+	assert(p->hoss == c->hoss);
+	c->flags |= (p->flags & (HOSS_MSYNC | HOSS_ORDERED | HOSS_DEFERRED));
+	c->status = p->status;
+	if (p->flags & HOSS_MSYNC) {
+		c->my_tx = 0;
+		c->dbs = hoss_idb_cache_ref(p->dbs);
+	} else {
+		c->my_tx = 1;
+		c->dbs = hoss_idb_cache_create();
+		if (c->dbs == NULL)
+			return ENOMEM;
+	}
+
+	return 0;
+}
+
+static __blocking int
+grp_prep(struct hoss_op *op)
+{
+	int rc;
+	struct hoss_grp *subgrp;
+	struct hoss_op *subop;
+
+	subgrp = (struct hoss_grp *)(op->vargs);
+	rc = 0;
+	for (subop = subgrp->deferred_ops.tqh_first;
+	     subop != NULL;
+	     subop = subop->ops.tqe_next) {
+		rc = subop->prep(subop);
+		if (rc != 0)
+			break;
+	}
+	op->prepped = 1;
+	return rc;
+}
+
+/* Handles restarting individual operations that deadlock and can be
+ * retried (i.e., no MSYNC specified). */
+static __blocking int
+grp_exec(struct hoss_op *op)
+{
+	int rc;
+	struct hoss_grp *subgrp;
+	struct hoss_op *subop;
+
+	subgrp = (struct hoss_grp *)(op->vargs);
+
+	do {
+		rc = 0;
+		for (subop = subgrp->deferred_ops.tqh_first;
+		     subop != NULL;
+		     subop = subop->ops.tqe_next) {
+			if ((subgrp->flags & HOSS_MSYNC) == 0) {
+				do {
+					rc = subop->exec(subop);
+				} while (rc == IDB_DEADLOCK);
+			} else {
+				rc = subop->exec(subop);
+				if (rc != 0) {
+					break;
+				}
+			}
+		}
+		break;
+	} while(0);
+
+	op->execed = 1;
+
+	return rc;
+}
+
+static __blocking int
+grp_finish(struct hoss_op *op)
+{
+	struct hoss_grp *grp;
+	struct hoss_op *subop;
+	int rc;
+
+	grp = (struct hoss_grp *)(op->vargs);
+	rc = 0;
+
+	for (subop = grp->deferred_ops.tqh_first;
+	     subop != NULL;
+	     subop = subop->ops.tqe_next) {
+		(void)subop->finish(subop);
+	}
+
+	if (grp->my_tx && (grp->idbx != NULL)) {
+		rc = _hoss_idbx_put(grp, ((grp->status) ? 0 : COMMIT) |
+				   END_OF_GRP);
+		grp->idbx = NULL;
+	}
+	op->prepped = op->execed = 0;
+	return rc;
+}
+
+static __blocking int
+grp_rollback(struct hoss_op *op)
+{
+	struct hoss_grp *subgrp;
+	struct hoss_op *subop;
+
+	subgrp = (struct hoss_grp *)(op->vargs);
+
+	for (subop = subgrp->deferred_ops.tqh_first;
+	     subop != NULL;
+	     subop = subop->ops.tqe_next) {
+		(void)subop->rollback(subop);
+	}
+	if (subgrp->my_tx && subgrp->idbx != NULL) {
+		(void)idb_end(subgrp->idbx, 0);
+	}
+	op->prepped = op->execed = 0;
+	return 0;
+}
+
+__blocking int
+grp_cleanup(struct hoss_op *op)
+{
+	struct hoss_grp *subgrp;
+	struct hoss_op *subop;
+
+	subgrp = (struct hoss_grp *)(op->vargs);
+
+	for (subop = subgrp->deferred_ops.tqh_first;
+	     subop != NULL;
+	     subop = subgrp->deferred_ops.tqh_first) {
+		if (subgrp->flags & HOSS_DEFERRED) {
+			TAILQ_REMOVE(&subgrp->deferred_ops, subop, ops);
+		}
+		(void)subop->cleanup(subop);
+	}
+	(void)hoss_idb_cache_deref(subgrp->dbs);
+	if (op->parent != NULL && (subgrp->flags & HOSS_DEFERRED)) {
+		TAILQ_REMOVE(&op->parent->deferred_ops, op, ops);
+	}
+	free(op);
+	return 0;
+}
+
+__blocking int
+hoss_grp_create(struct hoss_grp *parent, hoss_flags_t flags, struct hoss_ctx *hoss,
+	       struct hoss_op **_op)
+{
+	struct hoss_grp *child;
+	struct hoss_op *op;
+	int rc;
+
+	op = *_op = malloc(sizeof(*op) + sizeof(struct hoss_grp));
+	if (op == NULL)
+		return ENOMEM;
+	child = (struct hoss_grp *)(op->vargs);
+	op->parent = parent;
+
+	rc = inherit_init(child, flags, parent, hoss);
+
+	if (rc) {
+		free(op);
+		return rc;
+	}
+
+	op->prep = grp_prep;
+	op->prepped = 0;
+	op->exec = grp_exec;
+	op->execed = 0;
+	op->finish = grp_finish;
+	op->rollback = grp_rollback;
+	op->cleanup = grp_cleanup;
+
+	op->parent = parent;
+	return rc;
+}

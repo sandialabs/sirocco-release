@@ -1,0 +1,124 @@
+#include <aesop/aesop.h>
+#include <aesop/aethread.hae>
+#include <errno.h>
+#include <logging.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/queue.h>
+#include <sxm.h>
+
+#include "cb_proxy.hae"
+#include "xm_singleton.h"
+
+struct cb_proxy_list {
+	TAILQ_HEAD(cbpl_tqh, cb_proxy_data) outstanding;
+	pthread_mutex_t m;
+	pthread_cond_t c;
+	size_t nentries;
+	struct aethread_group *g;
+	unsigned shutdown:1;
+};
+static struct cb_proxy_list list;
+
+int
+cb_proxy_init(void)
+{
+	list.shutdown = 0;
+	TAILQ_INIT(&list.outstanding);
+	pthread_mutex_init(&list.m, NULL);
+	pthread_cond_init(&list.c, NULL);
+	list.nentries = 0;
+	list.g = aethread_create_group_pool(1);
+	if (list.g == NULL)
+	       	return -errno;
+	return 0;
+}
+
+void
+cb_proxy_fini(void)
+{
+	assert(list.nentries == 0);
+	pthread_mutex_destroy(&list.m);
+	pthread_cond_destroy(&list.c);
+	aethread_destroy_group(list.g);
+	return;
+}
+
+__blocking void
+cb_proxy_signal_stop(void)
+{
+	pthread_mutex_lock(&list.m);
+	pthread_cond_broadcast(&list.c);
+	list.shutdown = 1;
+	pthread_mutex_unlock(&list.m);
+}
+
+__blocking void
+cb_proxy_service(void)
+{
+	struct cb_proxy_data *d;
+	do {
+		pwait {
+			pbranch {
+				aethread_hint(list.g);
+				INFO(2, "Waiting for progress in "
+					"cb_proxy_service\n");
+				pthread_mutex_lock(&list.m);
+				while(list.nentries == 0 && !list.shutdown)
+					pthread_cond_wait(&list.c, &list.m);
+				d = list.outstanding.tqh_first;
+				if (d != NULL) {
+					TAILQ_REMOVE(&list.outstanding, d,
+						     entries);
+					list.nentries--;
+				}
+				pthread_mutex_unlock(&list.m);
+				if (d != NULL && d->ae_cb != NULL)
+					d->ae_cb(d);
+				d = NULL;
+			}
+		}
+	} while(!list.shutdown);
+
+	return;
+}
+
+static void
+cb_proxy_cb(struct xm_transport *xmx, struct xm_message *m)
+{
+	struct cb_proxy_data *cpd = m->data.ptr;
+
+	if (cpd->xm_chained_cb != NULL)
+		cpd->xm_chained_cb(xmx, m, cpd);
+	pthread_mutex_lock(&list.m);
+	if (list.nentries++ == 0)
+		pthread_cond_signal(&list.c);
+	TAILQ_INSERT_TAIL(&list.outstanding, cpd, entries);
+	pthread_mutex_unlock(&list.m);
+	return;
+};
+
+void
+cb_proxy_setup(struct xm_message *m,
+	       struct cb_proxy_data *d)
+{
+	m->callback = cb_proxy_cb;
+	m->data.ptr = d;
+}
+
+int
+cb_proxy_op(int (*xm_op)(struct xm_transport *,
+			 struct xm_message *),
+	    struct xm_transport *xmx,
+	    struct xm_message *m,
+	    struct cb_proxy_data *d)
+{
+	int rc;
+
+	cb_proxy_setup(m, d);
+	xms_get();
+	rc = xm_op(xmx, m);
+	xms_put();
+	return rc;
+}

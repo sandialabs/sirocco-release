@@ -1,0 +1,2 @@
+Verbosity - If required, should put in higher verbosity availability
+(perhaps on a per-message basis).

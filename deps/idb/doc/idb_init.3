@@ -1,0 +1,43 @@
+.\" Process this file with groff -man -Tascii foo.1
+.\"
+.TH IDB_INIT 3 "APRIL 2014" "Linux/OS X" "API Documentation"
+.SH NAME
+idb_init \- Initialize IDB runtime
+.SH LIBRARY
+The Interval Database Library (libidb, -lidb or -laeidb)
+.SH SYNOPSIS
+.nf
+.B #include <idb.h>
+
+.BI "int"
+.BI "idb_init(void);"
+.fi
+.SH DESCRIPTION
+The
+.BR idb_init ()
+function initializes the IDB library.
+.B idb_init ()
+may be called multiple times, and must be followed by an equal number of calls to
+.B idb_fini ().
+Upon successful completion, all other IDB functions may be called.
+.SH RETURN VALUES
+.I idb_init
+returns 0 on success, or an error code from
+.B <errno.h>.
+BerkeleyDB reserves the right to return practically any error code it
+wishes, so IDB functions will as well. The most likely/well defined
+error codes are:
+.TP
+.B ENOTRECOVERABLE
+The Berkeley DB state has become corrupt. To fix, IDB must be shut
+down and restarted.
+.TP
+.B ENOMEM
+There was insufficient memory available to complete the request.
+.SH BUGS
+.\".IP \(bu 3
+None yet identified, but give it time.
+.SH AUTHOR
+Written by Matthew L. Curry (mlcurry@sandia.gov).
+.SH SEE ALSO
+.BR IDB (3)

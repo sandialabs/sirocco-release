@@ -1,0 +1,10 @@
+Using the Aesop interface to IDB seems to be prone to deadlock, at
+least with the following command line:
+
+aeidb -dL -M$((1024*1024*1024)) -i50 -p8 100000
+
+idb.c needs to be modified such that deadlocks can be recovered from
+gracefully.
+
+Running without deadlock detection never locked up aeidb workloads. Is
+it possible we're running the deadlock detection too often?

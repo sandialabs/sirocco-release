@@ -1,0 +1,418 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+
+#define _GNU_SOURCE
+
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+
+#include <triton-list.h>
+#include <triton-hash.h>
+#include <aesop/aefile.hae>
+#include "fd-cache.hae"
+
+struct rs_fd_cache_instance
+{
+    struct triton_list unused_list;
+    struct triton_hash_table* log_table;
+    char* log_path;
+    int hash_count;
+    int alignment;
+    int flags;
+    int sync_highwater;
+    pthread_mutex_t mutex;
+};
+
+/* this is the point at which we try to close unused file descriptors */
+#define OPEN_WATERMARK 300
+
+static int log_compare(const void *key, struct triton_hash_link *hash_link);
+static void rs_fd_cache_destructor(struct rs_fd_cache_entry* entry);
+static __blocking void rs_fd_cache_purge_internal(struct rs_fd_cache_instance* fdci, int watermark);
+static void key_to_file_name(struct rs_fd_cache_instance* fdci, 
+    char* log_name, rs_key_t key);
+
+struct rs_fd_cache_instance* rs_fd_cache_initialize(
+    char* path,  /**< path on disk to data files */
+    int alignment, /**< I/O alignment */
+    int flags, /**< flags to modify open() behavior */
+    int sync_highwater /**< sync coalescing highwater mark */
+)
+{
+    struct rs_fd_cache_instance* fdci;
+
+    fdci = malloc(sizeof(*fdci));
+    if(!fdci)
+        return(NULL);
+    memset(fdci, 0, sizeof(*fdci));
+
+    fdci->log_path = strdup(path);
+    if(!fdci->log_path)
+    {
+        free(fdci);
+        return(NULL);
+    }
+
+    pthread_mutex_init(&fdci->mutex, NULL);
+
+    fdci->log_table = triton_hash_init(log_compare, triton_hash_64bit_hash, 200);
+    if(!fdci->log_table)
+    {
+        free(fdci->log_path);
+        pthread_mutex_destroy(&fdci->mutex);
+        free(fdci);
+        return(NULL);
+    }
+
+    triton_list_init(&fdci->unused_list);
+    fdci->alignment = alignment;
+    fdci->flags = flags;
+    fdci->sync_highwater = sync_highwater;
+
+    return(fdci);
+}
+
+void rs_fd_cache_finalize(struct rs_fd_cache_instance* fdci)
+{
+    struct triton_list_link* iterator;
+    struct triton_list_link* scratch;
+    struct rs_fd_cache_entry *tmp_entry;
+
+    triton_mutex_lock(&fdci->mutex);
+    
+    /* empty the lru list for safety */
+    triton_list_for_each(iterator, scratch, &fdci->unused_list)
+    {
+        tmp_entry = triton_list_get_entry(iterator, struct rs_fd_cache_entry,
+                unused_link);
+        triton_list_del(&tmp_entry->unused_link);
+    }
+
+    /* iterate through the whole table closing files and freeing memory */
+    triton_hash_destroy_and_finalize(fdci->log_table, struct rs_fd_cache_entry,
+            hash_link, rs_fd_cache_destructor);
+    fdci->log_table = NULL;
+
+    assert(fdci->hash_count == 0);
+    assert(triton_list_empty(&fdci->unused_list));
+    free(fdci->log_path);
+    triton_mutex_unlock(&fdci->mutex);
+    triton_mutex_destroy(&fdci->mutex);
+    free(fdci);
+    return;
+}
+
+__blocking int rs_fd_cache_get(struct rs_fd_cache_instance* fdci, 
+    struct rs_fd_cache_entry **entry, rs_key_t key)
+{
+    struct triton_hash_link* tmp_link;
+    struct rs_fd_cache_entry* tmp_entry;
+    struct rs_fd_cache_entry* new_entry;
+    char log_name [PATH_MAX];
+    int posix_open_flags = O_RDWR|O_CREAT;
+    struct stat statbuf;
+    int rc;
+
+#ifdef HAVE_O_NOATIME
+    posix_open_flags |= O_NOATIME;
+#endif
+    posix_open_flags |= fdci->flags;
+
+    triton_mutex_lock(&fdci->mutex);
+    assert(fdci->log_table);
+
+    tmp_link = triton_hash_search(fdci->log_table, &key);
+    if(tmp_link)
+    {
+        /* we already have it open */
+        tmp_entry = triton_list_get_entry(tmp_link, struct rs_fd_cache_entry,
+            hash_link);
+        if(tmp_entry->ref_count == 0)
+        {
+            assert(tmp_entry->unused_link.prev);
+            triton_list_del(&tmp_entry->unused_link);
+        }
+        tmp_entry->ref_count++;
+        triton_mutex_unlock(&fdci->mutex);
+        *entry = tmp_entry;
+        return(0);
+    }
+    triton_mutex_unlock(&fdci->mutex);
+
+    /* don't know about this one yet */
+    new_entry = malloc(sizeof(*new_entry));
+    if(!new_entry)
+    {
+        return(-ENOMEM);
+    }
+    memset(new_entry, 0, sizeof(*new_entry));
+    triton_mutex_init(&new_entry->log_offset_mutex, NULL);
+
+    new_entry->key = key;
+    new_entry->ref_count = 1;
+    new_entry->fdci = fdci;
+
+    key_to_file_name(fdci, log_name, key);
+
+    if(fdci->sync_highwater > 1)
+    {
+        /* explicit sync coalescing will be performed, so do not set O_SYNC
+         * for implicit sync on file descriptor
+         */
+        posix_open_flags = posix_open_flags & ~O_SYNC;
+    }
+    rc = aefile_open(log_name, posix_open_flags, 
+                     S_IRUSR|S_IWUSR);
+    if(rc < 0)
+    {
+        pthread_mutex_destroy(&new_entry->log_offset_mutex);
+        free(new_entry);
+        return(rc);
+    }
+    new_entry->fd = rc;
+
+    /* use the current size as the next log offset */
+    rc = aefile_fstat(new_entry->fd, &statbuf);
+    if(rc != 0)
+    {
+        close(new_entry->fd);
+        triton_mutex_destroy(&new_entry->log_offset_mutex);
+        free(new_entry);
+        return(-rc);
+    }
+    assert((statbuf.st_size % fdci->alignment) == 0);
+    new_entry->log_offset = statbuf.st_size;
+
+    triton_mutex_lock(&fdci->mutex);
+ 
+    /* check for race condition; someone else may have also opened this file 
+     * while we were trying to
+     */
+    tmp_link = triton_hash_search(fdci->log_table, &key);
+    if(tmp_link)
+    {
+        /* we already have it open */
+
+        /* get rid of new entry */
+        triton_mutex_destroy(&new_entry->log_offset_mutex);
+        close(new_entry->fd);
+        free(new_entry);
+
+        /* use entry that's already in the cache */
+        tmp_entry = triton_list_get_entry(tmp_link, struct rs_fd_cache_entry,
+            hash_link);
+        if(tmp_entry->ref_count == 0)
+        {
+            assert(tmp_entry->unused_link.prev);
+            triton_list_del(&tmp_entry->unused_link);
+        }
+        tmp_entry->ref_count++;
+        triton_mutex_unlock(&fdci->mutex);
+        *entry = tmp_entry;
+        return(0);
+    }
+
+    /* this is the first appearance of this fd in the cache; add it */
+    triton_hash_add(fdci->log_table, &key, &new_entry->hash_link);
+    fdci->hash_count++;
+    triton_mutex_unlock(&fdci->mutex);
+
+    /* do we have too many objects open now? */
+    if(fdci->hash_count > OPEN_WATERMARK)
+    {
+        rs_fd_cache_purge_internal(fdci, OPEN_WATERMARK);
+    }
+    
+    *entry = new_entry;
+    return(0);
+}
+
+static __blocking void rs_fd_cache_purge_internal(struct rs_fd_cache_instance* fdci, int watermark)
+{
+    struct triton_list_link* iterator;
+    struct triton_list_link* scratch;
+    struct rs_fd_cache_entry* dead_entry;
+    int ret;
+    struct stat statbuf;
+    triton_list_t purge_list;
+
+    triton_list_init(&purge_list);
+
+    triton_mutex_lock(&fdci->mutex);
+
+    /* go through unused list and move to a local list to be purged while we
+     * hold the lock
+     */
+    triton_list_for_each(iterator, scratch, &fdci->unused_list)
+    {
+        dead_entry = triton_list_get_entry(iterator, struct rs_fd_cache_entry,
+            unused_link);
+        assert(dead_entry->ref_count == 0);
+        triton_list_del(&dead_entry->unused_link);
+        triton_list_del(&dead_entry->hash_link);
+        triton_list_add_back(&dead_entry->unused_link, &purge_list);
+
+        fdci->hash_count--;
+        if(fdci->hash_count < watermark)
+            break;
+    }
+    triton_mutex_unlock(&fdci->mutex);
+
+    /* now go through the local purge list and close the files in question,
+     * no need to hold lock here.
+     */
+    triton_list_for_each(iterator, scratch, &purge_list)
+    {
+        dead_entry = triton_list_get_entry(iterator, struct rs_fd_cache_entry,
+            unused_link);
+        triton_list_del(&dead_entry->unused_link);
+        assert(dead_entry->ref_count == 0);
+
+        aefile_close(dead_entry->fd);
+
+        triton_mutex_destroy(&dead_entry->log_offset_mutex);
+        free(dead_entry);
+    }
+    
+    triton_list_destroy(&purge_list);
+
+    return;
+}
+
+void rs_fd_cache_put(struct rs_fd_cache_entry* entry)
+{
+    triton_mutex_lock(&entry->fdci->mutex);
+
+    assert(entry->fdci->log_table);
+    entry->ref_count--;
+    assert(entry->ref_count >= 0);
+
+    /* don't close anything here.  Just mark it as unused if the reference
+     * count hits zero
+     */
+    if(entry->ref_count == 0)
+    {
+        assert(entry->unused_link.prev == NULL);
+        triton_list_add_back(&entry->unused_link, &entry->fdci->unused_list);
+    }
+    triton_mutex_unlock(&entry->fdci->mutex);
+    return;
+}
+
+__blocking void rs_fd_cache_remove(
+    struct rs_fd_cache_instance* fdci,
+    rs_key_t key)
+{
+    struct triton_hash_link* tmp_link;
+    struct rs_fd_cache_entry* tmp_entry;
+    char log_name [PATH_MAX];
+    int ret;
+
+    triton_mutex_lock(&fdci->mutex);
+
+    /* do we have it open? */
+    tmp_link = triton_hash_search(fdci->log_table, &key);
+    if(tmp_link)
+    {
+        tmp_entry = triton_list_get_entry(tmp_link, struct rs_fd_cache_entry,
+                hash_link);
+        /* we are in trouble if someone is using this */
+        assert(tmp_entry->ref_count == 0);
+
+        /* get rid of the fd cache entry */
+        triton_list_del(&tmp_entry->unused_link);
+        triton_list_del(&tmp_entry->hash_link);
+        fdci->hash_count--;
+        triton_mutex_unlock(&fdci->mutex);
+
+        aefile_close(tmp_entry->fd);
+        
+        triton_mutex_destroy(&tmp_entry->log_offset_mutex);
+        free(tmp_entry);
+    }
+    else
+    {
+        triton_mutex_unlock(&fdci->mutex);
+    }
+
+    /* actually unlink the log file */
+    key_to_file_name(fdci, log_name, key);
+    aefile_unlink(log_name);
+
+    return;
+}
+
+static int log_compare(const void *key, struct triton_hash_link *hash_link)
+{
+    struct rs_fd_cache_entry *entry;
+
+    entry = triton_hash_get_entry(hash_link, struct rs_fd_cache_entry, hash_link);
+    if(memcmp(key, &entry->key, sizeof(rs_key_t)) == 0)
+        return(1);
+    else
+        return(0);
+}
+
+static void rs_fd_cache_destructor(struct rs_fd_cache_entry* entry)
+{
+    /* we have done something wrong if this is still in use */
+    assert(entry->ref_count == 0);
+
+    entry->fdci->hash_count--;
+    close(entry->fd);
+    triton_mutex_destroy(&entry->log_offset_mutex);
+    free(entry);
+
+    return;
+}
+
+__blocking void rs_fd_cache_purge(struct rs_fd_cache_instance* fdci)
+{
+    rs_fd_cache_purge_internal(fdci, 0);
+}
+
+static void key_to_file_name(struct rs_fd_cache_instance* fdci, 
+    char* log_name, rs_key_t key)
+{
+    int nonzero_key_bytes;
+    int filename_ints;
+    int i;
+
+    /* construct a unique file name based on leading nonzero bytes in key */
+    nonzero_key_bytes = 31;
+    while(key.data[nonzero_key_bytes] == 0 && nonzero_key_bytes >= 0)
+        nonzero_key_bytes--;
+    nonzero_key_bytes++;
+    filename_ints = nonzero_key_bytes/8;
+    if(nonzero_key_bytes % 8)
+        filename_ints++;
+    if(filename_ints == 0)
+        filename_ints = 1;
+    sprintf(log_name, "%s/", fdci->log_path);
+    for(i=0; i<filename_ints; i++)
+    {
+        uint64_t tmp;
+        tmp = *((uint64_t*)(&key.data[filename_ints*8]));
+        sprintf(&log_name[strlen(log_name)], "%llu.", llu(tmp));
+    }
+    sprintf(&log_name[strlen(log_name)], "dat");
+
+    return;
+}
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

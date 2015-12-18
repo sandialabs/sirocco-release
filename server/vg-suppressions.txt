@@ -1,0 +1,14 @@
+{
+	aethread_hint_leak
+	Memcheck:Leak
+	fun:malloc
+	fun:aethread_hint
+}
+
+{
+	pthread_dl_allocate_tls
+	Memcheck:Leak
+	fun:calloc
+	fun:_dl_allocate_tls
+	fun:pthread_create*
+}

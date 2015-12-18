@@ -1,0 +1,48 @@
+/*
+ * (C) 2014 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#ifndef __SYNC_MGR_HAE__
+#define __SYNC_MGR_HAE__
+
+#include <stdint.h>
+#include <triton-list.h>
+#include <aesop/aesop.h>
+
+/* an instantiation of a sync manager (more than one may be active
+ * simultaneously)
+ */
+struct sync_mgr_instance;
+struct sync_group;
+
+struct sync_mgr_instance* sync_mgr_initialize(
+    int sync_highwater,
+    int open_flags);
+
+void sync_mgr_finalize(struct sync_mgr_instance* smi);
+
+/* indicates that a write operation is starting */
+struct sync_group* sync_mgr_start_write(struct sync_mgr_instance* smi, int fd);
+
+/* indicates that a write operation has completed (this may trigger a sync,
+ * depending on the open_flags)
+ */
+__blocking int sync_mgr_end_write(struct sync_mgr_instance* smi, struct sync_group* sg);
+
+/* explicitly sync all previously completed write operations, regardless of
+ * flags 
+ */
+__blocking int sync_mgr_flush_all(struct sync_mgr_instance* smi);
+
+#endif
+
+/*
+ * Local variables:
+ *  c-indent-level: 4
+ *  c-basic-offset: 4
+ * End:
+ *
+ * vim: ft=c ts=8 sts=4 sw=4 expandtab
+ */

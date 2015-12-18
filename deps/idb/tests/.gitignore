@@ -1,0 +1,7 @@
+.deps/
+.dirstamp
+aeidb.ae
+aeidb
+ddlk
+idb
+*.o

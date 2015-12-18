@@ -1,0 +1,47 @@
+AUTOMAKE_OPTIONS = foreign
+ACLOCAL_AMFLAGS = -I m4
+
+bin_PROGRAMS =
+bin_SCRIPTS =
+noinst_LTLIBRARIES =
+noinst_PROGRAMS =
+lib_LTLIBRARIES =
+noinst_HEADERS = include/idb_impl_util.h include/idb_internal.h include/idb_lk.h
+TESTS =
+check_PROGRAMS =
+EXTRA_PROGRAMS =
+CLEANFILES = $(bin_SCRIPTS)
+MOSTLYCLEANFILES =
+MAINTAINERCLEANFILES =
+EXTRA_DIST =
+BUILT_SOURCES =
+AM_CTAGSFLAGS=--excmd=pattern -B --extra=+f --langmap=c:+.ae.hae -I pwait,pbranch
+include_HEADERS = include/idb.h include/aeidb.hae include/idb_dbg.h
+
+EXTRA_DIST += prepare.sh
+
+AM_CPPFLAGS = -I$(srcdir)/include
+AM_CFLAGS =
+AM_LIBS =
+
+AM_CXXFLAGS = $(AM_CFLAGS)
+
+lib_LTLIBRARIES += src/libidb.la src/libaeidb.la
+src_libidb_la_SOURCES = 
+src_libaeidb_la_SOURCES = 
+
+pkgconfigdir = $(libdir)/pkgconfig
+pkgconfig_DATA = maint/idb.pc maint/aeidb.pc
+
+AE_SRC = 
+AE_HDR = 
+
+include Make.rules
+
+include $(top_srcdir)/src/Makefile.subdir
+include $(top_srcdir)/tests/Makefile.subdir
+
+-include $(AE_SRC:.ae=.ae.d)
+-include $(AE_HDR:.hae=.hae.d)
+
+BUILT_SOURCES += $(AE_HDR:.hae=.hae.d)

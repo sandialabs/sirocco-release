@@ -1,0 +1,13 @@
+0.6.6
+-----
+No known outstanding issues.
+
+0.6.5.1
+-------
+Compiler warnings may occur for various strict configurations of flags.  These
+may be safely ignored and will be fixed in a future version.
+
+0.6.5
+-----
+Compiler warnings may be issued during compilation for "tommy_hashlin_remove"
+and "tommy_hashlin_search" -- these are normal and may be safely ignored.

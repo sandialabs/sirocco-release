@@ -1,0 +1,9 @@
+#include "internal.hae"
+
+/* Call grp->cleanup to destroy */
+__blocking int hoss_grp_create(struct hoss_grp *parent, hoss_flags_t flags,
+			      struct hoss_ctx *hoss, struct hoss_op **_op);
+
+/* Get the appropriate IDB transaction to use for this group. */
+IDBX hoss_idb_get(struct hoss_grp *g);
+

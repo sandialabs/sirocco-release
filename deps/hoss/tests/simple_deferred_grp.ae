@@ -1,0 +1,37 @@
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <assert.h>
+#include <stdio.h>
+
+#include <hoss.hae>
+
+__blocking int
+aemain(int argc, char **argv)
+{
+	struct hoss_grp *g, *g2;
+	struct hoss_ctx *hoss;
+	int rc;
+
+	printf("Hello, world!\n");
+
+	rc = hoss_init(&hoss, ".");
+	assert(rc == 0);
+
+	rc = hoss_begin(&g, NULL, HOSS_DEFERRED, hoss);
+	assert(rc == 0);
+
+	rc = hoss_begin(&g2, g, 0, hoss);
+	assert(rc == 0);
+
+	rc = hoss_end(g2, 1);
+	assert(rc == 0);
+
+	rc = hoss_end(g, 1);
+	assert(rc == 0);
+
+	hoss_fini(hoss);
+	return 0;
+}
+
+aesop_main_set(aemain);

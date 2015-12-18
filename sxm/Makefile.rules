@@ -1,0 +1,13 @@
+all: $(SXM_LIBNAME) $(SXM_TESTS)
+
+$(SXM_LIBNAME): $(SXM_LIBOBJS)
+	ar cr $@ $^
+	ranlib $@
+	cp sxm/sxm.h include
+
+$(SXM_TESTS): LDLIBS = -lssmptcp -lssm -lpthread
+$(SXM_TESTS): $(SXM_LIBNAME)
+
+sxm_clean:
+	rm -f $(SXM_TESTS) $(SXM_LIBNAME) $(SXM_LIBOBJS) sxm/*.o
+	rm -f include/sxm.h

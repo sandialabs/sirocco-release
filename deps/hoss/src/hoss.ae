@@ -1,0 +1,277 @@
+/* Flags and operations
+ *
+ * DEFERRED: Add to op list vs singleton op list executed immediately
+ * SHORT: Writes halt progress vs. process each normally
+ * ORDERED: sync before commit vs. not
+ * MSYNC: Use shared tx vs. use one tx per operation
+ * SPARSE: OK to read sparse records
+ */
+
+struct mmsghdr;
+#include <aesop/aesop.h>
+
+#include <aeidb.hae>
+#include <errno.h>
+#include <idb.h>
+#include <recordstore.hae>
+#include <stddef.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <sys/queue.h>
+
+#include "idb_cache.h"
+#include "grp.hae"
+#include "internal.hae"
+
+#ifdef __HOSS_BDB_SI__
+idb_flags_t HOSS_IDB_SNAPSHOT = IDB_USE_SNAPSHOT;
+#else
+idb_flags_t HOSS_IDB_SNAPSHOT = 0;
+#endif
+
+int _hoss_use_log = 0;
+
+__unused__ static void
+_bail(void)
+{
+
+	abort();
+}
+
+static int
+do_rs_log_init(struct hoss_ctx *hoss, const char *basepath)
+{
+	char *rs_opts;
+	size_t rs_opts_len, snlen;
+	int rc = 0;
+
+	rs_opts_len = strlen("path:") + strlen(basepath) +
+		strlen("/LOG") + 1;
+	rs_opts = malloc(rs_opts_len);
+	if (rs_opts == NULL) {
+		return errno;
+	}
+
+	snlen = snprintf(rs_opts, rs_opts_len, "path:%s/LOG", basepath);
+	assert(snlen + 1 == rs_opts_len);
+	hoss->rs = rs_init("log", rs_opts);
+	if (hoss->rs == NULL) {
+		rc = errno;
+		ERR("Could not start recordstore with options %s: %s\n",
+		    rs_opts, strerror(rc));
+	}
+	free(rs_opts);
+
+	return rc;
+}
+
+static int
+do_rs_file_init(struct hoss_ctx *hoss, const char *basepath)
+{
+	char *rs_opts;
+	size_t rs_opts_len, snlen;
+	int rc = 0;
+
+	rs_opts_len = strlen("path:") + strlen(basepath) + strlen("/f") + 1;
+	rs_opts = malloc(rs_opts_len);
+	if (rs_opts == NULL) {
+		return errno;
+	}
+
+	snlen = snprintf(rs_opts, rs_opts_len, "path:%s/f", basepath);
+	assert(snlen + 1 == rs_opts_len);
+	hoss->rs = rs_init("file", rs_opts);
+	if (hoss->rs == NULL) {
+		rc = errno;
+		ERR("Could not start recordstore with options %s: %s\n",
+		    rs_opts, strerror(rc));
+	}
+	free(rs_opts);
+
+	return rc;
+}
+
+static int
+do_rs_init(struct hoss_ctx *hoss, const char *basepath)
+{
+	if (_hoss_use_log)
+		return do_rs_log_init(hoss, basepath);
+	else
+		return do_rs_file_init(hoss, basepath);
+}
+
+/* Try to do this last, as it creates a directory */
+static int
+do_idb_init(struct hoss_ctx *hoss, const char *basepath)
+{
+	char *idb_env_path;
+	size_t idb_env_path_len, snlen;
+	int rc = 0, dirmade = 0;
+
+	idb_env_path_len = strlen(basepath) + strlen("/idb") + 1;
+	idb_env_path = malloc(idb_env_path_len);
+	if (idb_env_path == NULL)
+		return errno;
+
+	do {
+		snlen = snprintf(idb_env_path, idb_env_path_len, "%s/idb",
+				 basepath);
+		assert(snlen + 1 == idb_env_path_len);
+		rc = mkdir(idb_env_path, 0755);
+		if (rc == 0)
+			dirmade = 1;
+		else if (errno != EEXIST) {
+			rc = errno;
+			ERR("Could not make directory %s: %s\n",
+			    idb_env_path, strerror(rc));
+			break;
+		}
+
+		rc = 0;
+		hoss->idbc = idb_init(idb_env_path, IDB_SHARED_TABLE |
+				     HOSS_IDB_SNAPSHOT);
+		if (hoss->idbc == NULL) {
+			rc = errno;
+			ERR("Could not start IDB at %s: %s\n",
+			    idb_env_path, strerror(rc));
+			break;
+		}
+	} while(0);
+
+	if (rc && dirmade) {
+		(void)rmdir(idb_env_path);
+	}
+	free(idb_env_path);
+	return rc;
+}
+
+int
+hoss_init(struct hoss_ctx **_hoss, const char *_path)
+{
+	struct hoss_ctx *hoss;
+	int rc;
+
+	*_hoss = hoss = malloc(sizeof(*hoss));
+	if (hoss == NULL)
+		return errno;
+
+	do {
+        /* attempt to create the basepath before initializing - OK if it
+         * already exists */
+		rc = mkdir(_path, 0755);
+		if (rc != 0 && errno != EEXIST) {
+			rc = errno;
+			break;
+		}
+		rc = do_rs_init(hoss, _path);
+		if (rc != 0)
+			break;
+
+		rc = do_idb_init(hoss, _path);
+		if (rc != 0) {
+			rs_finalize(hoss->rs);
+		}
+	} while(0);
+
+	if (rc) {
+		ERR("hoss_init failed\n");
+		free(hoss);
+	}
+	errno = rc;
+	return rc;
+}
+
+int
+hoss_init_config(struct hoss_ctx **_hoss, struct rs_instance *rs, IDBC idbc)
+{
+	struct hoss_ctx *hoss;
+
+	if (rs == NULL || idbc == NULL)
+		return EFAULT;
+	*_hoss = hoss = malloc(sizeof(*hoss));
+	if (hoss == NULL)
+		return errno;
+
+	hoss->rs = rs;
+	hoss->idbc = idbc;
+
+	return 0;
+}
+
+void
+hoss_fini(struct hoss_ctx *hoss)
+{
+
+	rs_finalize(hoss->rs);
+	idb_fini(hoss->idbc);
+	free(hoss);
+}
+
+__blocking int
+hoss_begin(struct hoss_grp **_child, struct hoss_grp *parent,
+	  hoss_flags_t flags, struct hoss_ctx *hoss)
+{
+	struct hoss_op *op;
+	int rc;
+
+	rc = hoss_grp_create(parent, flags, hoss, &op);
+	if (rc != 0)
+		return rc;
+
+	*_child = (struct hoss_grp *)(op->vargs);
+	rc = op->prep(op);
+	if (rc != 0) {
+		op->cleanup(op);
+		return rc;
+	}
+
+	if (parent != NULL && (parent->flags & HOSS_DEFERRED)) {
+		TAILQ_INSERT_TAIL(&parent->deferred_ops, op, ops);
+	}
+
+	return rc;
+}
+
+/* Handles restarting groups */
+__blocking int
+hoss_end(struct hoss_grp *grp, unsigned commit)
+{
+	int rc;
+	struct hoss_op *op;
+	unsigned deferred_root;
+
+	rc = 0;
+	op = (struct hoss_op *)(((char *)grp)-offsetof(struct hoss_op, vargs));
+	deferred_root = (grp->flags & HOSS_DEFERRED == 0) ||
+		(grp->parent == NULL ||
+		 ((grp->parent->flags & HOSS_DEFERRED) == 0));
+
+	if (deferred_root) {
+		if (commit) {
+			do {
+				rc = op->exec(op);
+				if (deferred_root && rc == IDB_DEADLOCK) {
+					rc = _hoss_idbx_put(grp, END_OF_GRP);
+					grp->status = 0;
+					continue;
+				} else {
+					break;
+				}
+			} while(1);
+
+			if (rc != 0) {
+				(void)op->rollback(op);
+			} else {
+				rc = op->finish(op);
+			}
+			(void)op->cleanup(op);
+		} else {
+			(void)op->rollback(op);
+			(void)op->cleanup(op);
+		}
+	}
+	return rc;
+}

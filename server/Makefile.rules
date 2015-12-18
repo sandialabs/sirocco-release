@@ -1,0 +1,12 @@
+server/sos_prot.h server/sos_prot.c: server/sos_prot.x
+	cd server && rpcgen -h sos_prot.x > sos_prot.h ; \
+	rpcgen -c sos_prot.x > sos_prot.c
+
+server/sos_prot.o: server/sos_prot.h server/sos_prot.c
+
+$(SERVER_SERVER): LDLIBS = -lhoss -lrecordstore -laeidb -ldb -laesop \
+		  -lc-utils -lopa -lev -lsxm -lssmptcp -lssm -lpthread
+$(SERVER_SERVER): $(SXM_LIBNAME) $(SERVER_COBJS) $(SERVER_AEOBJS)
+
+server_clean:
+	rm -f $(SERVER_SERVER) $(SERVER_OBJS) server/sos_prot.h server/sos_prot.c

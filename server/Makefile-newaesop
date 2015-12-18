@@ -1,0 +1,71 @@
+PATH=/bin:/usr/bin:/usr/local/bin:../../../depinst/bin
+LDFLAGS+=-L../../../depinst/lib -L../xm/
+CFLAGS+=-I../../../depinst/include -I../xm
+CPPFLAGS+=$(CFLAGS)
+
+CFILES=
+AEPROGS=latency server client
+CPROGS=
+
+LDLIBS += -lm -lpthread -lxm -lhoss -lrecordstore
+
+LIBASGSVC_OBJ=sos_prot.o asg_exec.o xm_singleton.o xmu_addr.o sos_prot.o xmu_buf_pool.o cb_proxy.o msg_header.o signal_shutdown.o
+
+PROGS=$(AEPROGS) $(CPROGS)
+
+AEBP=ae-blocking-parser
+AECC=aecc
+
+CFLAGS+=-g -O0
+CFLAGS+=-Wall -Wextra -Wno-unused-label
+
+#for libdb types and my -std=c99
+CPPFLAGS+=-D_BSD_SOURCE
+
+#Detect whether warnings/other stuff are needed. For gcc-4.7.
+ifeq ("$(USE_EXCESSIVE_GCC_WARNINGS)","")
+	CFLAGS+=-Wno-unused-label -Wno-unused-parameter
+else
+	EXCESSIVE_GCC_WARNINGS+= -std=c99 -pedantic -Wformat=2		\
+	-Winit-self -Wmissing-include-dirs -Wswitch-default		\
+	-Wswitch-enum -Wunused -Wuninitialized -Wfloat-equal		\
+	-Wdeclaration-after-statement -Wundef -Wshadow			\
+	-Wpointer-arith -Wbad-function-cast -Wcast-qual -Wcast-align	\
+	-Wconversion -Wsign-conversion -Wlogical-op			\
+	-Wstrict-prototypes -Wold-style-definition			\
+	-Wmissing-field-initializers -Wmissing-declarations		\
+	-Wmissing-prototypes -Wredundant-decls -Wnested-externs		\
+	-Wstack-protector -fstack-protector -Wno-variadic-macros	\
+	-Wunused-label -Wno-unused-parameter -Werror
+endif
+
+%.o: %.ae
+	$(AECC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+ae%.ae : %.c
+	touch $@
+
+$(CFILES:%.c=%.o): CFLAGS+=$(EXCESSIVE_GCC_WARNINGS)
+
+all: $(PROGS) libasgsvc.a
+
+relink:
+	rm -f $(PROGS)
+	make $(PROGS)
+
+$(AEPROGS): LDLIBS+= -laeidb -ldb -laesop -lc-utils -lopa -lev
+$(AEPROGS): libasgsvc.a
+
+libasgsvc.a: libasgsvc.a($(LIBASGSVC_OBJ))
+
+sos_prot.h:
+	rpcgen -h sos_prot.x > sos_prot.h
+
+sos_prot.c: sos_prot.h
+	rpcgen -c sos_prot.x > sos_prot.c
+
+clean:
+	rm -f *.a *.o
+	rm -rf *.dSYM
+	rm -f $(PROGS)
+	rm -f sos_prot.[ch]

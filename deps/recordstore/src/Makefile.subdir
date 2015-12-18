@@ -1,0 +1,27 @@
+src_librecordstore_a_SOURCES += \
+ src/dummy.c \
+ src/recordstore.ae \
+ src/recordstore-mem.ae \
+ src/recordstore-file.ae \
+ src/fd-cache.ae \
+ src/alignment.ae \
+ src/sync-mgr.ae \
+ src/alignment.hae \
+ src/fd-cache.hae \
+ src/sync-mgr.hae
+
+AE_SRC += \
+ src/recordstore.ae \
+ src/recordstore-mem.ae \
+ src/recordstore-file.ae \
+ src/fd-cache.ae \
+ src/alignment.ae \
+ src/sync-mgr.ae
+
+include_HEADERS += \
+ src/recordstore-method.hae
+
+if HAVE_KINETIC
+  src_librecordstore_a_SOURCES += src/recordstore-kinetic.ae
+  AE_SRC += src/recordstore-kinetic.ae
+endif

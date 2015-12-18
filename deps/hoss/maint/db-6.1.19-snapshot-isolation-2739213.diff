@@ -1,0 +1,16 @@
+--- src\btree\bt_search.c	Tue Jun 10 11:32:56 2014
++++ src\btree\bt_search.c	Tue Sep 23 12:56:09 2014
+@@ -232,9 +232,11 @@
+ 		} else if (atomic_read(&mpf->mfp->multiversion) != 0 &&
+ 		    lock_mode == DB_LOCK_WRITE && (ret = __memp_dirty(mpf, &h,
+ 		    dbc->thread_info, dbc->txn, dbc->priority, 0)) != 0) {
+-			(void)__memp_fput(mpf,
+-			    dbc->thread_info, h, dbc->priority);
++			if (h != NULL)
++				(void)__memp_fput(mpf,
++			    	dbc->thread_info, h, dbc->priority);
+ 			(void)__LPUT(dbc, lock);
++			return (ret);
+ 		}
+ 	}
+ 

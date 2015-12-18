@@ -1,0 +1,66 @@
+#include <aesop/aesop.h>
+#include <aesop/timer.hae>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "logging.h"
+#include "signal_shutdown.hae"
+
+int signal_shutdown = 0;
+
+void
+shutdown_handler(int sig)
+{
+	signal_shutdown++;
+	if (signal_shutdown > 1)
+		abort();
+}
+
+int
+signal_shutdown_init(void)
+{
+	size_t i;
+	int rc;
+
+	const int signals[] = {SIGTERM, SIGINT, SIGQUIT, SIGHUP};
+	const char *signame[] = {"SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP"};
+	const size_t nsignals = sizeof(signals)/sizeof(signals[0]);
+
+	struct sigaction sa, old;
+
+	sa.sa_handler = shutdown_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	for (i = 0; i < nsignals; i++) {
+		rc = sigaction(signals[i], NULL, &old);
+		if (rc == 0 && old.sa_handler == SIG_IGN) {
+			continue;
+		}
+		rc = sigaction(signals[i], &sa, NULL);
+		if (rc) {
+			WARN("Could not set shutdown signal handler for %s\n",
+			     signame[i]);
+		}
+	}
+	return 0;
+}
+
+int signal_shutdown_fini(void)
+{
+	return 0;
+}
+
+__blocking int
+signal_shutdown_wait(void)
+{
+	int rc;
+
+	rc = AE_SUCCESS;
+	while(rc == AE_SUCCESS && signal_shutdown == 0) {
+		rc = aesop_timer(1000);
+		INFO(4, "Cycling through signal_shutdown_wait\n");
+	}
+	INFO(1, "Exiting signal_shutdown_wait\n");
+	return rc;
+}

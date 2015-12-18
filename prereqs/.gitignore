@@ -1,0 +1,9 @@
+install
+pkg
+
+# These are included here to prevent getting out of sync with upstream recordstore
+recordstore/maint/recordstore.pc
+recordstore/src/.deps/
+recordstore/src/.dirstamp
+recordstore/src/librecordstore.a
+recordstore/stamp-h1
