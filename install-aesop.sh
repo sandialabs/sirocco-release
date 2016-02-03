@@ -6,6 +6,7 @@
 set -e
 set -u
 
+if false; then
 # Process some arguments
 TEMP=`getopt -o n --long no-build -n 'install-aesop.sh' -- "$@"`
 if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
@@ -22,6 +23,7 @@ done
 if [ "$1" != "" ]; then
     echo "Unrecognized argument: $1"
     exit 1
+fi
 fi
 set -u
 
@@ -50,6 +52,17 @@ download_if_absent()
 AEPKG=${PWD}/aesop-pkgs
 PFX=${PWD}
 mkdir -p ${AEPKG}
+
+# Download and install libev
+cd ${AEPKG}
+LIBEV_NAME=libev-4.22.tar.gz
+download_if_absent ${LIBEV_NAME}.tar.gz http://dist.schmorp.de/libev/libev-4.22.tar.gz
+if [ "${build}" = "1" ]; then
+    tar xf ${LIBEV_NAME}.tar.gz
+    cd ${LIBEV_NAME}
+    ./configure --prefix=${PFX}
+    make install
+fi
 
 # Download and install libopa
 cd ${AEPKG}
