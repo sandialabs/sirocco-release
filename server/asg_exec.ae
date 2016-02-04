@@ -353,67 +353,6 @@ read_svc(struct asgop *op)
 	return 0;
 }
 
-__blocking int
-time_svc(struct asgop *op) {
-	struct asgsvc *svc;
-	struct xm_message repl;
-	struct iovec iov;
-	time_t epoch;
-	XDR xdrs;
-	bool_t enc;
-	int rc;
-	struct TIME1args *arg;
-	struct TIME1res *r;
-
-	epoch = 0;
-
-	arg = &op->arg->c.request.SOS.SOSargs_u.t;
-	r = &op->arg->c.result.SOS.SOSres_u.t;
-
-	repl.flags = XM_F_IFWRONLY;
-	repl.addr = op->p->address;
-	repl.match = arg->ret;
-	repl.iov = &iov;
-	repl.iovcnt = 1;
-
-	epoch = time(NULL);
-
-	if (epoch == (time_t)(-1))
-		r->status = SOS1_FAIL;
-	else {
-		r->status = SOS1_OK;
-		r->TIME1res_u.time = epoch;
-	}
-
-	xdrmem_create(&xdrs, op->bp[0], sizeof(TIME1res), XDR_ENCODE);
-
-	enc = xdr_TIME1res(&xdrs, r);
-	if (enc == FALSE) {
-		ERR("XDR of time result failed\n");
-	}
-
-	iov.iov_base = op->bp[0];
-	iov.iov_len = xdr_getpos(&xdrs);
-
-	rc = sync_xm_op(xm_put, op->p->xmx, &repl);
-
-	if (repl.error) {
-		ERR("error: %s\n", strerror(repl.error));
-	}
-	if (rc != 0) {
-		ERR("Put of time result failed: %s\n", strerror(-rc));
-	}
-
-	if (r->status == SOS1_OK) {
-		free(op->buf);
-		op->buf = NULL;
-	}
-
-	INFO(2, "timesvc returning %d\n", r->status);
-
-	return 0;
-}
-
 /* Always returns 0. Errors are indicated in return structure. */
 __blocking int
 write_svc(struct asgop *op)
@@ -604,21 +543,8 @@ batch_svc(struct asgop *op) {
 
 	xdrmem_create(&xdrs, cmdbuf, arg->bufsiz, XDR_DECODE);
 
-	INFO(2, "creating thread pool\n");
-	b.t = aethread_create_group_pool(1);
-
-	if (b.t == NULL) {
-		free(op->buf);
-		free(op);
-		r->status = SOS1_FAIL;
-		INFO(2, "batch_svc aethread_create_group_pool returning %d\n",
-		     r->status);
-		return 0;
-	}
-		
 	pwait {
 		pbranch {
-			aethread_hint(b.t);
 			rc = _batch_svc(&b, &xdrs, svc, r);
 		}
 	}
@@ -627,8 +553,6 @@ batch_svc(struct asgop *op) {
 		(void )hoss_end(b.g, 0);
 		b_free(&b);
 	}
-
-	aethread_destroy_group(b.t);
 
         return 0;
 }
@@ -765,17 +689,6 @@ prealloc(struct asgop *op) {
 		op->bp[0] = op->buf;
 		op->bp[1] = op->buf + op->arg->c.request.SOS.SOSargs_u.b.bufsiz;
                 break;
-	case SOS1_TIME:
-		len = sizeof(TIME1res);
-		op->bps = 1;
-		op->buf = malloc(len);
-		if (op->buf == NULL) {
-			errno = ENOMEM;
-			return -1;
-		}
-		memset(op->buf, 0, len);
-		op->bp[0] = op->buf;
-		break;		
         default:
 		ERR("unrecognized op: %d\n", op->op);
                 return -1;
@@ -948,15 +861,6 @@ sos_svc(struct asgarg *asgargs, struct peer_record *p, void *data)
 	bx->retbuf = NULL;
 	TAILQ_INIT(&bx->ops);
 	
-	INFO(2, "creating thread pool\n");
-	bx->t = aethread_create_group_pool(1);
-	
-	if (bx->t == NULL) {
-		free(bx);
-		r->status = SOS1_FAIL;
-		INFO(2, "sos_svc returning %d\n", r->status);
-	}
-	
 	bx->p.xmx = p->xmx;
 	bx->p.address = ssm_addr_cp(p->xmx->ssm,
 				    p->address);
@@ -971,7 +875,6 @@ sos_svc(struct asgarg *asgargs, struct peer_record *p, void *data)
 	
 	pwait {
 		pbranch {
-			aethread_hint(bx->t);
 			rc = _sos_svc(bx, svc, r, b, cmdbuf, p, data);
 		}
 	}
@@ -981,7 +884,6 @@ sos_svc(struct asgarg *asgargs, struct peer_record *p, void *data)
 		b_free(bx);
 	} else if (rc == 0) {
 		INFO(2, "destroying batch\n");
-		aethread_destroy_group(bx->t);
 		ssm_addr_destroy(bx->p.xmx->ssm,
 				 bx->p.address);
 		(void )hoss_end(bx->g, 1);

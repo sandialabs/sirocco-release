@@ -23,7 +23,6 @@ struct asgbatch {
 	struct BATCH1res rc;
 	void *retbuf;
 	match1 ret;
-	struct aethread_group *t;
 	size_t len;
 };
 

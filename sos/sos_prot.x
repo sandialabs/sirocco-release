@@ -23,8 +23,7 @@ enum sosop1 {
 	SOS1_PUNCH      = 3,
 	SOS1_BATCH      = 4,
 	SOS1_COMMIT     = 5,
-	SOS1_TIME       = 6,
-	SOS1_WRITE      = 7
+	SOS1_WRITE      = 6
 };
 
 struct nsid1 {
@@ -116,19 +115,6 @@ struct BATCH1res {
 	sosstat1 status;
 };
 
-/* time */
-
-struct TIME1args {
-	match1 ret;
-};
-
-union TIME1res switch (sosstat1 status) {
- case SOS1_OK:
-	 time1 time;
- default:
-	 void;
-};
-
 union SOSargs switch (sosop1 op) {
  case SOS1_WRITE:
 	 WRITE1args w;
@@ -136,8 +122,6 @@ union SOSargs switch (sosop1 op) {
 	 READ1args r;
  case SOS1_BATCH:
 	 BATCH1args b;
- case SOS1_TIME:
-	 TIME1args t;
  default:
 	 void;
 };
@@ -149,47 +133,8 @@ union SOSres switch (sosop1 op) {
 	 READ1res r;
  case SOS1_BATCH:
 	 BATCH1res b;
- case SOS1_TIME:
-	 TIME1res t;
  default:
 	 void;
-};
-
-const MMBRLIST_MAX_ADDR_LEN = 128;
-const MMBRLIST_MAX_ADDRS = 32;
-
-struct addrspec {
-	opaque a<MMBRLIST_MAX_ADDR_LEN>;
-};
-
-struct MMBRLIST1args {
-	struct  addrspec addr;
-	uint32_t ttl;
-};
-
-struct MMBRLIST1resok {
-       struct addrspec addr<MMBRLIST_MAX_ADDRS>;
-};
-
-union MMBRLIST1res switch (sosstat1 status) {
-case SOS1_OK:
-	MMBRLIST1resok resok;
-default:
-	void;
-};
-
-enum MMBRADD1_JOINTYPE {
-	RANDOM = 1,
-	NEARBY = 2
-};
-
-struct MMBRADD1args {
-	MMBRADD1_JOINTYPE type;
-        struct addrspec reply_addr;
-};
-
-struct MMBRADD1res {
-	sosstat1 status;
 };
 
 struct msg_header {
@@ -201,11 +146,5 @@ program SOS_PROGRAM {
 	version SOS1_VERSION {
 		BATCH1res
 		SOSBATCH1_OP(BATCH1args) = 1;
-		MMBRLIST1res
-		MMBRPROC1_LIST(MMBRLIST1args) = 2;
-		MMBRADD1res
-		MMBRPROC1_ADD(MMBRADD1args) = 3;
-		time_t
-		SOSSVR_TIME() = 4;
 	} = 1;
 } = 0x20202020;
