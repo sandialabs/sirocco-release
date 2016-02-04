@@ -5,13 +5,12 @@
 
 set -e
 set -u
+build=1
 
-if false; then
 # Process some arguments
 TEMP=`getopt -o n --long no-build -n 'install-aesop.sh' -- "$@"`
 if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
 eval set -- "$TEMP"
-build=1
 set +u
 while true ; do
     case "$1" in
@@ -23,7 +22,6 @@ done
 if [ "$1" != "" ]; then
     echo "Unrecognized argument: $1"
     exit 1
-fi
 fi
 set -u
 
