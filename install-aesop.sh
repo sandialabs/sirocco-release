@@ -53,7 +53,7 @@ mkdir -p ${AEPKG}
 
 # Download and install libev
 cd ${AEPKG}
-LIBEV_NAME=libev-4.22.tar.gz
+LIBEV_NAME=libev-4.22
 download_if_absent ${LIBEV_NAME}.tar.gz http://dist.schmorp.de/libev/libev-4.22.tar.gz
 if [ "${build}" = "1" ]; then
     tar xf ${LIBEV_NAME}.tar.gz
