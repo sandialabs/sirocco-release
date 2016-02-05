@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
@@ -8,6 +9,13 @@
 #include "sxm.h"
 
 int xm_verbose;
+int xm_flaky_put;
+int xm_flaky_get;
+
+int failed_gets = 0;
+int failed_puts = 0;
+int total_gets = 0;
+int total_puts = 0;
 
 static void
 minit(pthread_mutex_t *m)
@@ -253,6 +261,24 @@ xm_send(struct xm_transport *xmx, struct xm_message *xmmsg)
 
 	if (XM_F_ISRW(xmmsg->flags))
 		return -(errno = EINVAL);
+	assert(XM_F_ISRDONLY(xmmsg->flags) || XM_F_ISWRONLY(xmmsg->flags));
+	if (xm_flaky_get && XM_F_ISWRONLY(xmmsg->flags) &&
+	    rand() % 100 <= xm_flaky_get) {
+		xmmsg->flags = 0xDEADBEEF;
+		failed_gets++;
+		fprintf(stderr, "!!!WARNING!!! "
+			"Flaky get is about to return ENETFAIL (%i%% so far)\n",
+			failed_gets * 100 / (failed_gets + total_gets));
+	}
+	if (xm_flaky_put && XM_F_ISRDONLY(xmmsg->flags) &&
+	    rand() % 100 <= xm_flaky_put) {
+		xmmsg->flags = 0xDEADBEEF;
+		failed_puts++;
+		fprintf(stderr, "!!!WARNING!!! "
+			"Flaky put is about to return ENETFAIL (%i%% so far)\n",
+			failed_puts * 100 / (failed_puts + total_puts));
+		
+	}
 
 	xmmsg->_cb.pcb = xm_ssm_send_wrap;
 	xmmsg->_cb.cbdata = xmmsg;
@@ -271,12 +297,33 @@ xm_send(struct xm_transport *xmx, struct xm_message *xmmsg)
 	if (xmmsg->_mr == NULL && STASH_ERRNO(err))
 		goto mr_failed;
 
-	if (XM_F_ISRDONLY(xmmsg->flags))
+	if (XM_F_ISRDONLY(xmmsg->flags)) {
 		xmmsg->_tx = ssm_put(xmx->ssm, xmmsg->addr, xmmsg->_mr, NULL,
 				     xmmsg->match, &xmmsg->_cb, SSM_NOF);
-	else
+		total_puts++;
+	} else if (XM_F_ISWRONLY(xmmsg->flags)) {
 		xmmsg->_tx = ssm_get(xmx->ssm, xmmsg->addr, xmmsg->_md, xmmsg->_mr,
 				     xmmsg->match, &xmmsg->_cb, SSM_NOF);
+		total_gets++;
+	} else {
+		/* Flaked, or a serious error */
+		assert(xmmsg->flags == 0xDEADBEEF);
+		ssm_result_t res = {
+			.id = xmx->ssm,
+			.me = NULL,
+			.tx = xmmsg->_tx,
+			.bits = xmmsg->match,
+			.status = SSM_ST_DROP,
+			.op = 0,
+			.addr = xmmsg->addr,
+			.mr = xmmsg->_mr,
+			.md = xmmsg->_md,
+			.bytes = 0,
+		};
+		xm_ssm_send_wrap(xmmsg, &res);
+		return 0;
+	}
+
 	if (xmmsg->_tx == NULL && STASH_ERRNO(err))
 		goto op_failed;
 	return 0;
@@ -408,6 +455,14 @@ xmtcp_start(struct xm_transport **xmxp, uint16_t listen_port)
 {
 	struct xm_transport *xmx;
 	int err;
+
+	if (xm_flaky_get || xm_flaky_put) {
+		fprintf(stderr, "!!! WARNING !!!\n");
+		fprintf(stderr, "!!! xm_flakey is set (%i%% on puts, "
+			"%i%% on gets), some transfers will fail !!!\n",
+			((xm_flaky_put <= 100) ? xm_flaky_put : 100),
+			((xm_flaky_get <= 100) ? xm_flaky_get : 100));
+	}
 
 	xmx = *xmxp = malloc(sizeof(*xmx));
 	if (xmx == NULL && STASH_ERRNO(err))

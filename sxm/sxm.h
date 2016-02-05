@@ -25,6 +25,12 @@
 
 extern int xm_verbose;
 
+/* Reasonable values for flaky variables range from 0-100,
+ * representing percentage chance of failure with error code.
+ */
+extern int xm_flaky_put;
+extern int xm_flaky_get;
+
 #include <ssm.h>
 #include <ssmptcp.h>
 #include <stdint.h>

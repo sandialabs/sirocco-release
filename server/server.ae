@@ -369,6 +369,8 @@ aemain(int argc, char **argv)
 	struct progargs pa;
 	ssm_Haddr joinaddr;
 
+	xm_flaky_get = 25;
+
 	PID = getpid();
 
 	if (parseargs(argc, argv, &pa)) {
