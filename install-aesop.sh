@@ -54,7 +54,7 @@ mkdir -p ${AEPKG}
 # Download and install libev
 cd ${AEPKG}
 LIBEV_NAME=libev-4.22
-download_if_absent ${LIBEV_NAME}.tar.gz http://dist.schmorp.de/libev/libev-4.22.tar.gz
+download_if_absent ${LIBEV_NAME}.tar.gz http://dist.schmorp.de/libev/Attic/libev-4.22.tar.gz
 if [ "${build}" = "1" ]; then
     tar xf ${LIBEV_NAME}.tar.gz
     cd ${LIBEV_NAME}
@@ -65,10 +65,12 @@ fi
 # Download and install libopa
 cd ${AEPKG}
 OPENPA_NAME=openpa-1.0.4
-download_if_absent ${OPENPA_NAME}.tar.gz http://trac.mpich.org/projects/openpa/raw-attachment/wiki/Downloads/${OPENPA_NAME}.tar.gz
+OPENPA_AR_NAME=v1.0.4.tar.gz
+download_if_absent ${OPENPA_AR_NAME} https://github.com/pmodels/openpa/archive/${OPENPA_AR_NAME}
 if [ "${build}" = "1" ]; then
-    tar xf ${OPENPA_NAME}.tar.gz
+    tar xf ${OPENPA_AR_NAME}
     cd ${OPENPA_NAME}
+    ./autogen.sh
     ./configure --prefix=${PFX}
     make install
 fi
